@@ -984,9 +984,13 @@ class FeishuAdapter(BasePlatformAdapter):
         configured = extra.get("require_mention")
         if configured is not None:
             if isinstance(configured, str):
-                return configured.strip().lower() in ("true", "1", "yes", "on")
+                value = configured.strip().lower()
+                # Default-true semantics: only explicit false-like values disable mention gating.
+                return value not in ("false", "0", "no", "off")
             return bool(configured)
-        return os.getenv("FEISHU_REQUIRE_MENTION", "true").strip().lower() in ("true", "1", "yes", "on")
+        env_value = os.getenv("FEISHU_REQUIRE_MENTION", "true").strip().lower()
+        # Default-true semantics for env var as well.
+        return env_value not in ("false", "0", "no", "off")
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
