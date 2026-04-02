@@ -135,8 +135,9 @@ DEFAULT_COMMAND_TIMEOUT = 30
 # Default session timeout (seconds)
 DEFAULT_SESSION_TIMEOUT = 300
 
-# Max tokens for snapshot content before summarization
-SNAPSHOT_SUMMARIZE_THRESHOLD = 8000
+# Default max chars for snapshot content before summarization
+# Can be overridden via config.yaml browser.snapshot_threshold
+DEFAULT_SNAPSHOT_THRESHOLD = 20000
 
 
 def _get_command_timeout() -> int:
@@ -154,6 +155,23 @@ def _get_command_timeout() -> int:
     except Exception as e:
         logger.debug("Could not read command_timeout from config: %s", e)
     return DEFAULT_COMMAND_TIMEOUT
+
+
+def _get_snapshot_threshold() -> int:
+    """Return the configured snapshot threshold from config.yaml.
+
+    Reads ``config["browser"]["snapshot_threshold"]`` and falls back to
+    ``DEFAULT_SNAPSHOT_THRESHOLD`` (20000) if unset or unreadable.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        val = cfg.get("browser", {}).get("snapshot_threshold")
+        if val is not None:
+            return max(int(val), 1000)  # Floor at 1000 to avoid too-small thresholds
+    except Exception as e:
+        logger.debug("Could not read snapshot_threshold from config: %s", e)
+    return DEFAULT_SNAPSHOT_THRESHOLD
 
 
 def _get_vision_model() -> Optional[str]:
@@ -1113,17 +1131,19 @@ def _extract_relevant_content(
         return _truncate_snapshot(snapshot_text)
 
 
-def _truncate_snapshot(snapshot_text: str, max_chars: int = 8000) -> str:
+def _truncate_snapshot(snapshot_text: str, max_chars: Optional[int] = None) -> str:
     """
     Simple truncation fallback for snapshots.
     
     Args:
         snapshot_text: The snapshot text to truncate
-        max_chars: Maximum characters to keep
+        max_chars: Maximum characters to keep (default from config browser.snapshot_threshold)
         
     Returns:
         Truncated text with indicator if truncated
     """
+    if max_chars is None:
+        max_chars = _get_snapshot_threshold()
     if len(snapshot_text) <= max_chars:
         return snapshot_text
     
@@ -1305,10 +1325,11 @@ def browser_snapshot(
         refs = data.get("refs", {})
         
         # Check if snapshot needs summarization
-        if len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD and user_task:
+        threshold = _get_snapshot_threshold()
+        if len(snapshot_text) > threshold and user_task:
             snapshot_text = _extract_relevant_content(snapshot_text, user_task)
-        elif len(snapshot_text) > SNAPSHOT_SUMMARIZE_THRESHOLD:
-            snapshot_text = _truncate_snapshot(snapshot_text)
+        elif len(snapshot_text) > threshold:
+            snapshot_text = _truncate_snapshot(snapshot_text, max_chars=threshold)
         
         response = {
             "success": True,
