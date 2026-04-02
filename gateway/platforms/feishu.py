@@ -270,6 +270,7 @@ class FeishuAdapterSettings:
     webhook_host: str
     webhook_port: int
     webhook_path: str
+    require_mention: bool  # Require @mention in group chats (default: true)
     ws_reconnect_nonce: int = 30
     ws_reconnect_interval: int = 120
     ws_ping_interval: Optional[int] = None
@@ -277,6 +278,7 @@ class FeishuAdapterSettings:
     admins: frozenset[str] = frozenset()
     default_group_policy: str = ""
     group_rules: Dict[str, FeishuGroupRule] = field(default_factory=dict)
+
 
 
 @dataclass
@@ -1059,6 +1061,21 @@ class FeishuAdapter(BasePlatformAdapter):
         self._load_seen_message_ids()
 
     @staticmethod
+    def _resolve_require_mention(extra: Dict[str, Any]) -> bool:
+        """Resolve require_mention setting from extra config or env var.
+
+        Uses explicit None check to handle falsy values correctly:
+        - If extra["require_mention"] exists, use it (even if False)
+        - Otherwise fallback to FEISHU_REQUIRE_MENTION env var (default: true)
+        """
+        configured = extra.get("require_mention")
+        if configured is not None:
+            if isinstance(configured, str):
+                return configured.strip().lower() in ("true", "1", "yes", "on")
+            return bool(configured)
+        return os.getenv("FEISHU_REQUIRE_MENTION", "true").strip().lower() in ("true", "1", "yes", "on")
+
+    @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
         # Parse per-group rules from config
         raw_group_rules = extra.get("group_rules", {})
@@ -1126,6 +1143,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 str(extra.get("webhook_path") or os.getenv("FEISHU_WEBHOOK_PATH", _DEFAULT_WEBHOOK_PATH)).strip()
                 or _DEFAULT_WEBHOOK_PATH
             ),
+            require_mention=FeishuAdapter._resolve_require_mention(extra),
             ws_reconnect_nonce=_coerce_required_int(extra.get("ws_reconnect_nonce"), default=30, min_value=0),
             ws_reconnect_interval=_coerce_required_int(extra.get("ws_reconnect_interval"), default=120, min_value=1),
             ws_ping_interval=_coerce_int(extra.get("ws_ping_interval"), default=None, min_value=1),
@@ -1158,6 +1176,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._webhook_host = settings.webhook_host
         self._webhook_port = settings.webhook_port
         self._webhook_path = settings.webhook_path
+        self._require_mention = settings.require_mention
         self._ws_reconnect_nonce = settings.ws_reconnect_nonce
         self._ws_reconnect_interval = settings.ws_reconnect_interval
         self._ws_ping_interval = settings.ws_ping_interval
@@ -2989,9 +3008,17 @@ class FeishuAdapter(BasePlatformAdapter):
         return bool(sender_ids and (sender_ids & self._allowed_group_users))
 
     def _should_accept_group_message(self, message: Any, sender_id: Any, chat_id: str = "") -> bool:
-        """Require an explicit @mention before group messages enter the agent."""
+        """Check if a group message should be routed to the agent.
+
+        Uses require_mention setting to control whether @mention is needed:
+        - require_mention=true (default): Only route if bot is @mentioned or @_all
+        - require_mention=false: Route all allowed group messages without @mention
+        """
         if not self._allow_group_message(sender_id, chat_id):
             return False
+        # If require_mention is disabled, accept all allowed group messages
+        if not self._require_mention:
+            return True
         # @_all is Feishu's @everyone placeholder — always route to the bot.
         raw_content = getattr(message, "content", "") or ""
         if "@_all" in raw_content:

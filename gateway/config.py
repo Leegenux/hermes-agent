@@ -588,6 +588,12 @@ def load_gateway_config() -> GatewayConfig:
                         ntc = ",".join(str(v) for v in ntc)
                     os.environ["DISCORD_NO_THREAD_CHANNELS"] = str(ntc)
 
+            # Feishu/Lark settings → env vars (env vars take precedence)
+            feishu_cfg = yaml_cfg.get("feishu", {})
+            if isinstance(feishu_cfg, dict):
+                if "require_mention" in feishu_cfg and not os.getenv("FEISHU_REQUIRE_MENTION"):
+                    os.environ["FEISHU_REQUIRE_MENTION"] = str(feishu_cfg["require_mention"]).lower()
+
             # Telegram settings → env vars (env vars take precedence)
             telegram_cfg = yaml_cfg.get("telegram", {})
             if isinstance(telegram_cfg, dict):
