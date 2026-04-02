@@ -1021,7 +1021,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 str(extra.get("webhook_path") or os.getenv("FEISHU_WEBHOOK_PATH", _DEFAULT_WEBHOOK_PATH)).strip()
                 or _DEFAULT_WEBHOOK_PATH
             ),
-            require_mention=os.getenv("FEISHU_REQUIRE_MENTION", "true").strip().lower() not in ("false", "0", "no"),
+            require_mention=(
+                str(extra.get("require_mention") or os.getenv("FEISHU_REQUIRE_MENTION", "true")).strip().lower()
+                not in ("false", "0", "no")
+            ),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
