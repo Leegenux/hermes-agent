@@ -550,6 +550,12 @@ def load_gateway_config() -> GatewayConfig:
                 if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
                     os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
 
+            # Feishu/Lark settings → env vars (env vars take precedence)
+            feishu_cfg = yaml_cfg.get("feishu", {})
+            if isinstance(feishu_cfg, dict):
+                if "require_mention" in feishu_cfg and not os.getenv("FEISHU_REQUIRE_MENTION"):
+                    os.environ["FEISHU_REQUIRE_MENTION"] = str(feishu_cfg["require_mention"]).lower()
+
             # Telegram settings → env vars (env vars take precedence)
             telegram_cfg = yaml_cfg.get("telegram", {})
             if isinstance(telegram_cfg, dict):

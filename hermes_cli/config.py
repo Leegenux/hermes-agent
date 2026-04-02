@@ -472,6 +472,11 @@ DEFAULT_CONFIG = {
         "reactions": True,             # Add 👀/✅/❌ reactions to messages during processing
     },
 
+    # Feishu/Lark platform settings (gateway mode)
+    "feishu": {
+        "require_mention": True,       # Require @mention to respond in group chats (default: true)
+    },
+
     # WhatsApp platform settings (gateway mode)
     "whatsapp": {
         # Reply prefix prepended to every outgoing WhatsApp message.
