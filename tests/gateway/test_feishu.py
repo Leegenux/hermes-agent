@@ -2818,6 +2818,70 @@ class TestGroupMentionAtAll(unittest.TestCase):
         self.assertTrue(adapter._should_accept_group_message(message, allowed_sender, ""))
 
 
+class TestRequireMentionDisabled(unittest.TestCase):
+    """Tests for require_mention=false behavior in group chats."""
+
+    @patch.dict(
+        os.environ,
+        {"FEISHU_GROUP_POLICY": "open", "FEISHU_REQUIRE_MENTION": "false"},
+        clear=True,
+    )
+    def test_group_message_accepted_without_mention_when_require_mention_false(self):
+        """When require_mention=false, group messages are accepted without @mention."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        message = SimpleNamespace(content='{"text":"hello"}', mentions=[])
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertTrue(adapter._should_accept_group_message(message, sender_id))
+
+    @patch.dict(
+        os.environ,
+        {"FEISHU_GROUP_POLICY": "open", "FEISHU_REQUIRE_MENTION": "true"},
+        clear=True,
+    )
+    def test_group_message_rejected_without_mention_when_require_mention_true(self):
+        """Default behavior: require_mention=true requires @mention."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        message = SimpleNamespace(content='{"text":"hello"}', mentions=[])
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertFalse(adapter._should_accept_group_message(message, sender_id))
+
+    @patch.dict(os.environ, {"FEISHU_GROUP_POLICY": "open"}, clear=True)
+    def test_require_mention_defaults_to_true_when_unset(self):
+        """When FEISHU_REQUIRE_MENTION is unset, default is true (require mention)."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        message = SimpleNamespace(content='{"text":"hello"}', mentions=[])
+        sender_id = SimpleNamespace(open_id="ou_any", user_id=None)
+        self.assertFalse(adapter._should_accept_group_message(message, sender_id))
+
+    @patch.dict(
+        os.environ,
+        {"FEISHU_GROUP_POLICY": "allowlist", "FEISHU_ALLOWED_USERS": "ou_allowed", "FEISHU_REQUIRE_MENTION": "false"},
+        clear=True,
+    )
+    def test_require_mention_false_still_respects_allowlist_policy(self):
+        """require_mention=false bypasses mention check but NOT allowlist policy."""
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        message = SimpleNamespace(content='{"text":"hello"}', mentions=[])
+        # Allowlisted user — should pass.
+        allowed_sender = SimpleNamespace(open_id="ou_allowed", user_id=None)
+        self.assertTrue(adapter._should_accept_group_message(message, allowed_sender))
+        # Non-allowlisted user — should be blocked.
+        blocked_sender = SimpleNamespace(open_id="ou_blocked", user_id=None)
+        self.assertFalse(adapter._should_accept_group_message(message, blocked_sender))
+
+
 @unittest.skipUnless(_HAS_LARK_OAPI, "lark-oapi not installed")
 class TestSenderNameResolution(unittest.TestCase):
     """Tests for _resolve_sender_name_from_api."""
