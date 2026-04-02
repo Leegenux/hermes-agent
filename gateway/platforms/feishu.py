@@ -270,6 +270,7 @@ class FeishuAdapterSettings:
     webhook_host: str
     webhook_port: int
     webhook_path: str
+    require_mention: bool  # Require @mention in group chats (default: true)
 
 
 @dataclass
@@ -1020,6 +1021,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 str(extra.get("webhook_path") or os.getenv("FEISHU_WEBHOOK_PATH", _DEFAULT_WEBHOOK_PATH)).strip()
                 or _DEFAULT_WEBHOOK_PATH
             ),
+            require_mention=os.getenv("FEISHU_REQUIRE_MENTION", "true").strip().lower() not in ("false", "0", "no"),
         )
 
     def _apply_settings(self, settings: FeishuAdapterSettings) -> None:
@@ -1042,6 +1044,7 @@ class FeishuAdapter(BasePlatformAdapter):
         self._webhook_host = settings.webhook_host
         self._webhook_port = settings.webhook_port
         self._webhook_path = settings.webhook_path
+        self._require_mention = settings.require_mention
 
     def _build_event_handler(self) -> Any:
         if EventDispatcherHandler is None:
@@ -2665,9 +2668,17 @@ class FeishuAdapter(BasePlatformAdapter):
         return bool(sender_open_id and sender_open_id in self._allowed_group_users)
 
     def _should_accept_group_message(self, message: Any, sender_id: Any) -> bool:
-        """Require an explicit @mention before group messages enter the agent."""
+        """Check if a group message should be routed to the agent.
+
+        Uses require_mention setting to control whether @mention is needed:
+        - require_mention=true (default): Only route if bot is @mentioned or @_all
+        - require_mention=false: Route all allowed group messages without @mention
+        """
         if not self._allow_group_message(sender_id):
             return False
+        # If require_mention is disabled, accept all allowed group messages
+        if not self._require_mention:
+            return True
         # @_all is Feishu's @everyone placeholder — always route to the bot.
         raw_content = getattr(message, "content", "") or ""
         if "@_all" in raw_content:
