@@ -980,14 +980,23 @@ class FeishuAdapter(BasePlatformAdapter):
         Uses explicit None check to handle falsy values correctly:
         - If extra["require_mention"] exists, use it (even if False)
         - Otherwise fallback to FEISHU_REQUIRE_MENTION env var (default: true)
+
+        For the env var fallback, explicit false-like values disable mentions,
+        while any other value—including an empty string—keeps the documented
+        default of True.
         """
         configured = extra.get("require_mention")
         if configured is not None:
             if isinstance(configured, str):
                 return configured.strip().lower() in ("true", "1", "yes", "on")
             return bool(configured)
-        return os.getenv("FEISHU_REQUIRE_MENTION", "true").strip().lower() in ("true", "1", "yes", "on")
 
+        env_value = os.getenv("FEISHU_REQUIRE_MENTION")
+        if env_value is None:
+            return True
+
+        normalized = env_value.strip().lower()
+        return normalized not in ("false", "0", "no", "off")
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
         return FeishuAdapterSettings(
