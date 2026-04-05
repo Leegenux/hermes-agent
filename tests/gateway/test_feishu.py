@@ -2474,8 +2474,8 @@ class TestGroupMentionAtAll(unittest.TestCase):
         self.assertTrue(adapter._should_accept_group_message(message, allowed_sender))
 
 
-class TestRequireMentionDisabled(unittest.TestCase):
-    """Tests for require_mention=false behavior in group chats."""
+class TestRequireMentionBehavior(unittest.TestCase):
+    """Tests for require_mention behavior in group chats."""
 
     @patch.dict(
         os.environ,
