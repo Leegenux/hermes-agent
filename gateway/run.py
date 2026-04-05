@@ -4127,7 +4127,12 @@ class GatewayRunner:
             max_snapshots=cp_cfg.get("max_snapshots", 50),
         )
 
-        cwd = os.path.expanduser(os.getenv("MESSAGING_CWD", str(Path.home())))
+        cwd = os.path.expanduser(
+            os.getenv(
+                "TERMINAL_CWD",
+                os.getenv("MESSAGING_CWD", str(Path.home())),
+            )
+        )
         arg = event.get_command_args().strip()
 
         if not arg:
