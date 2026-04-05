@@ -207,7 +207,7 @@ os.environ["HERMES_EXEC_ASK"] = "1"
 # respect it. Otherwise use MESSAGING_CWD or default to home directory.
 _configured_cwd = os.environ.get("TERMINAL_CWD", "")
 if not _configured_cwd or _configured_cwd in (".", "auto", "cwd"):
-    messaging_cwd = os.getenv("MESSAGING_CWD") or str(Path.home())
+    messaging_cwd = os.path.expanduser(os.getenv("MESSAGING_CWD") or str(Path.home()))
     os.environ["TERMINAL_CWD"] = messaging_cwd
 
 from gateway.config import (
@@ -4126,7 +4126,7 @@ class GatewayRunner:
             max_snapshots=cp_cfg.get("max_snapshots", 50),
         )
 
-        cwd = os.getenv("MESSAGING_CWD", str(Path.home()))
+        cwd = os.path.expanduser(os.getenv("MESSAGING_CWD", str(Path.home())))
         arg = event.get_command_args().strip()
 
         if not arg:
