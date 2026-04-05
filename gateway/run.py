@@ -208,6 +208,7 @@ os.environ["HERMES_EXEC_ASK"] = "1"
 _configured_cwd = os.environ.get("TERMINAL_CWD", "")
 if not _configured_cwd or _configured_cwd in (".", "auto", "cwd"):
     messaging_cwd = os.path.expanduser(os.getenv("MESSAGING_CWD") or str(Path.home()))
+    os.environ["MESSAGING_CWD"] = messaging_cwd
     os.environ["TERMINAL_CWD"] = messaging_cwd
 
 from gateway.config import (
