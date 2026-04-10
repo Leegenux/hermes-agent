@@ -276,6 +276,13 @@ def build_anthropic_client(api_key: str, base_url: str = None):
         if common_betas:
             kwargs["default_headers"] = {"anthropic-beta": ",".join(common_betas)}
 
+    # Identify hermes-agent traffic to meridian-style proxies. Unknown headers
+    # are ignored by the official Anthropic API and other Anthropic-compatible
+    # endpoints, so this is safe to send unconditionally. Meridian's adapter
+    # detection picks it up via `x-meridian-agent: hermes` and routes the
+    # request to its hermes adapter (passthrough mode, client-side tools).
+    kwargs.setdefault("default_headers", {})["x-meridian-agent"] = "hermes"
+
     return _anthropic_sdk.Anthropic(**kwargs)
 
 

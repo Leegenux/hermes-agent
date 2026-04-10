@@ -82,7 +82,8 @@ class TestBuildAnthropicClient:
             kwargs = mock_sdk.Anthropic.call_args[1]
             assert kwargs["base_url"] == "https://custom.api.com"
             assert kwargs["default_headers"] == {
-                "anthropic-beta": "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14"
+                "anthropic-beta": "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
+                "x-meridian-agent": "hermes",
             }
 
     def test_minimax_anthropic_endpoint_uses_bearer_auth_for_regular_api_keys(self):
@@ -95,7 +96,8 @@ class TestBuildAnthropicClient:
             assert kwargs["auth_token"] == "minimax-secret-123"
             assert "api_key" not in kwargs
             assert kwargs["default_headers"] == {
-                "anthropic-beta": "interleaved-thinking-2025-05-14"
+                "anthropic-beta": "interleaved-thinking-2025-05-14",
+                "x-meridian-agent": "hermes",
             }
 
     def test_minimax_cn_anthropic_endpoint_omits_tool_streaming_beta(self):
@@ -108,8 +110,28 @@ class TestBuildAnthropicClient:
             assert kwargs["auth_token"] == "minimax-cn-secret-123"
             assert "api_key" not in kwargs
             assert kwargs["default_headers"] == {
-                "anthropic-beta": "interleaved-thinking-2025-05-14"
+                "anthropic-beta": "interleaved-thinking-2025-05-14",
+                "x-meridian-agent": "hermes",
             }
+
+    def test_x_meridian_agent_header_always_present(self):
+        """The x-meridian-agent: hermes header must be injected on every auth
+        path so meridian's adapter detection can identify hermes traffic. The
+        header is harmless to non-meridian Anthropic-compatible endpoints."""
+        cases = [
+            # (api_key, base_url)
+            ("sk-ant-oat01-" + "x" * 60, None),                            # OAuth
+            ("sk-ant-api03-something", None),                              # Regular API key
+            ("sk-ant-api03-x", "https://custom.api.com"),                  # Third-party endpoint
+            ("minimax-secret-123", "https://api.minimax.io/anthropic"),    # Bearer auth
+        ]
+        for api_key, base_url in cases:
+            with patch("agent.anthropic_adapter._anthropic_sdk") as mock_sdk:
+                build_anthropic_client(api_key, base_url=base_url)
+                kwargs = mock_sdk.Anthropic.call_args[1]
+                assert kwargs["default_headers"]["x-meridian-agent"] == "hermes", (
+                    f"x-meridian-agent header missing for api_key={api_key!r} base_url={base_url!r}"
+                )
 
 
 class TestReadClaudeCodeCredentials:
