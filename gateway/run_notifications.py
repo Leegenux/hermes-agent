@@ -595,6 +595,31 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 logger.info("Sent home-channel startup notification to %s:%s", platform.value, home.chat_id)
         return delivered
 
+    async def _send_ordinary_start_notice(self) -> None:
+        """Owe the online notice on an ORDINARY start — the no-marker path (#27870).
+
+        The planned-restart marker only exists when the previous process went down *for a restart*,
+        so a cold boot, a supervisor/crash recovery and a CLI ``stop`` + ``start`` (all of Windows)
+        reached the boot pass with nothing owed and stayed silent. Rather than send once here, this
+        stamps the same marker the restart path uses, so the existing replay discharges it: now for
+        every live home channel, and again from ``_schedule_planned_restart_replay`` when a platform
+        that was offline at boot comes back (#112109). The throttle keeps a crash loop from owing —
+        and therefore paging — on every attempt (#60438).
+        """
+        from gateway.restart_notice import write_planned_restart_marker
+        from gateway.run import _planned_restart_notification_path
+        from gateway.startup_notice import should_send_startup_notice, stamp_startup_notice
+
+        if not should_send_startup_notice():
+            logger.info("Ordinary-start home-channel notification throttled")
+            return
+        write_planned_restart_marker()
+        await self._replay_pending_planned_restart_notification()
+        # Still on disk: some home channel is unreached and still owed, so leave the window open
+        # for the next boot or the reconnect replay instead of burning the throttle.
+        if not _planned_restart_notification_path().exists():
+            stamp_startup_notice()
+
     async def _send_session_db_warning_notifications(self) -> None:
         """Broadcast a state.db failure warning to all home channels.
 
