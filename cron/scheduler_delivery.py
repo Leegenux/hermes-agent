@@ -233,13 +233,6 @@ def _maybe_mirror_cron_delivery(
         )
 
 
-# chat_type slot a platform's adapter puts on a NON-DM in-thread reply. Discord (and the default)
-# key the shared "thread" lane; Slack, Matrix and Telegram (forum topics: ``_build_message_event``
-# types every supergroup "group") keep the parent channel/room's "group" — a seed on the wrong slot
-# is a row no reply ever resolves to (#111896, #112918).
-_THREAD_REPLY_CHAT_TYPE = {"slack": "group", "matrix": "group", "telegram": "group"}
-
-
 def _open_continuable_cron_thread(job: dict, adapter, chat_id: str, loop) -> Optional[str]:
     """Open a thread for a continuable cron job via ``adapter.create_handoff_thread``. Returns the
     thread_id, or ``None`` (no thread primitive / failed) = caller falls back to the DM mirror."""
@@ -265,39 +258,23 @@ def _open_continuable_cron_thread(job: dict, adapter, chat_id: str, loop) -> Opt
 
 def _seed_cron_session(
     job: dict, adapter, platform_name: str, chat_id: str, text: str, *, thread_id: Optional[str],
-    chat_type: str, user_id: Optional[str], user_name: Optional[str] = None,
-    chat_name: Optional[str], scope_id: Optional[str], discord_keys_on_thread: bool = False,
+    chat_type: Optional[str], user_id: Optional[str], user_name: Optional[str] = None,
+    chat_name: Optional[str], scope_id: Optional[str],
 ) -> bool:
     """Create the session row (so the mirror has a target) and mirror the brief as a USER turn.
-    The seeded key must equal the reply's ``build_session_key``: chat_type, user_id, thread_id and
-    scope_id (Slack team id) are all part of it, so callers pass exactly what the reply carries."""
-    from gateway.config import Platform
-    from gateway.session import SessionSource
+
+    The seeded key must equal the reply's ``build_session_key``. ``chat_type`` (the origin's own,
+    authoritative for Matrix DM rooms too) is handed to the shared resolver, which owns the rest of
+    the normalization — Discord keying the thread id as chat_id, Slack's team scope_id — so every
+    delivery path seeds the same session an inbound reply resolves to (#111896, #112918, #66172)."""
     from gateway.mirror import mirror_to_session
-    seeded_session_id: Optional[str] = None
-    session_store = getattr(adapter, "_session_store", None)
-    if session_store is not None:
-        try:
-            platform_enum = Platform(platform_name.lower())
-        except (ValueError, KeyError):
-            platform_enum = None
-        if platform_enum is not None:
-            # Discord keys in-thread messages with chat_id == thread_id; Slack/Telegram use the
-            # parent channel.
-            seed_chat_id = (
-                str(thread_id)
-                if discord_keys_on_thread and platform_enum == Platform.DISCORD
-                else str(chat_id)
-            )
-            dest_source = SessionSource(
-                platform=platform_enum, chat_id=seed_chat_id, chat_name=chat_name,
-                chat_type=chat_type,
-                user_id=user_id, user_name=user_name, thread_id=thread_id,
-                scope_id=str(scope_id) if scope_id else None)
-            # Create the row and pass its exact id to the mirror — origin-heuristic rediscovery
-            # bails on populated chats.
-            _entry = session_store.get_or_create_session(dest_source)
-            seeded_session_id = getattr(_entry, "session_id", None)
+    from gateway.session_seed import ensure_destination_session
+    # allow_group_key: the caller carries the ORIGIN's real user_id, so a participant-keyed
+    # group/channel seed is exactly the reply's key (cron's flat in_channel seed).
+    seeded_session_id = ensure_destination_session(
+        platform_name, str(chat_id), thread_id=thread_id, user_id=user_id, user_name=user_name,
+        chat_name=chat_name, scope_id=scope_id, chat_type=chat_type, allow_group_key=True,
+        adapter=adapter)
     return mirror_to_session(
         platform_name, str(chat_id), _cron_mirror_message(job, text),
         source_label="cron", thread_id=thread_id, user_id=user_id, role="user",
@@ -313,8 +290,8 @@ def _seed_cron_thread_session(
     user's in-thread reply resolves to a transcript without it. Threads are participant-shared
     (no real user_id); a DM thread must seed ``chat_type="dm"`` — DM-thread replies route through
     the DM arm (``…:dm:<chat>:<thread>``), so a "thread"-typed seed is a row no DM reply hits.
-    Non-DM threads seed the slot the platform's adapter puts on an in-thread reply
-    (``_THREAD_REPLY_CHAT_TYPE``)."""
+    A non-DM thread passes no chat_type: the shared resolver takes the chat's own recorded type,
+    which is authoritative for Slack/Matrix/Telegram topic lanes."""
     text = (mirror_text or "").strip()
     if not text:
         return
@@ -322,9 +299,8 @@ def _seed_cron_thread_session(
         ok = _seed_cron_session(
             job, adapter, platform_name, chat_id, text,
             thread_id=str(thread_id),
-            chat_type="dm" if is_dm else _THREAD_REPLY_CHAT_TYPE.get(platform_name.lower(), "thread"),
-            user_id="system:cron", user_name="Cron", chat_name=chat_name, scope_id=scope_id,
-            discord_keys_on_thread=True)
+            chat_type="dm" if is_dm else None,
+            user_id="system:cron", user_name="Cron", chat_name=chat_name, scope_id=scope_id)
         if ok:
             logger.info(
                 "Job '%s': opened continuable thread %s on %s:%s and seeded the brief",
@@ -1429,6 +1405,15 @@ def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> No
             "skipped; the plain mirror below may still apply",
             job["id"], t.platform_name, t.chat_id,
             origin.get("platform"), origin.get("chat_id"), origin.get("thread_id"))
+    # Explicit THREAD target (deliver="telegram:<chat>:<thread>") that is neither a thread this job
+    # opened nor the in_channel surface: the mirror below only APPENDS, so without a seed the
+    # thread's session — born with the user's first reply — never holds the brief and that reply
+    # starts empty (hermes#67384). Gated on mirror opt-in: the seed IS the mirror write here.
+    if t.thread_id and t.mirror_this_target and not (thread_seeded or inchannel_seeded):
+        _seed_cron_thread_session(
+            job, t.runtime_adapter, t.platform_name, t.chat_id, str(t.thread_id), t.mirror_text,
+            **seed_kwargs)
+        thread_seeded = True
     _maybe_mirror_cron_delivery(
         job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
         user_id=t.origin_user_id,

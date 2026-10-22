@@ -1033,7 +1033,7 @@ class WebhookAdapter(BasePlatformAdapter):
             thread_id = extra.get("message_thread_id") or extra.get("thread_id")  # Telegram forum topics
             result = await adapter.send(chat_id, content, metadata={"thread_id": thread_id} if thread_id else None)
             if result.success:
-                self._mirror_delivery(platform_name, str(chat_id), content, delivery, thread_id)
+                self._mirror_delivery(platform_name, str(chat_id), content, delivery, thread_id, adapter)
             return result
 
     def _delivery_config(self, profile: Optional[str]):
@@ -1044,7 +1044,7 @@ class WebhookAdapter(BasePlatformAdapter):
         return load_gateway_config()
 
     def _mirror_delivery(self, platform_name: str, chat_id: str, content: str, delivery: dict,
-                         thread_id: Optional[str]) -> None:
+                         thread_id: Optional[str], adapter=None) -> None:
         """Best-effort mirror of a delivered response into the TARGET chat's session transcript, so a
         follow-up there ("so he's out?") sees what the webhook run just told the user. Without this the
         text only lives in the ephemeral opaque per-delivery webhook session and the target chat's
@@ -1062,8 +1062,11 @@ class WebhookAdapter(BasePlatformAdapter):
         route = delivery.get("route") or "webhook"
         try:
             from gateway.mirror import mirror_to_session
+            from gateway.session_seed import ensure_destination_session
             ok = mirror_to_session(platform_name, chat_id, f"[Webhook delivery: {route}]\n{content}",
-                                   source_label="webhook", thread_id=thread_id, role="user")
+                                   source_label="webhook", thread_id=thread_id, role="user",
+                                   session_id=ensure_destination_session(
+                                       platform_name, chat_id, thread_id=thread_id, adapter=adapter))
             logger.log(logging.INFO if ok else logging.DEBUG,
                        "[webhook] Route '%s' delivery %smirrored into %s:%s session", route, "" if ok else "not ",
                        platform_name, chat_id)
