@@ -22,6 +22,18 @@ from gateway.config import Platform
 from gateway.session import SessionSource, build_session_key
 
 
+def _fake_seed_adapter(platform: str):
+    """Live-adapter stand-in: the seed asks the ADAPTER to build the session source
+    (profile routing lives there), so the fake must stamp its own platform instead of
+    returning a MagicMock. The keys asserted below are unchanged — only who builds
+    the source moved."""
+    store = MagicMock()
+    adapter = MagicMock()
+    adapter._session_store = store
+    adapter.build_source = lambda **kw: SessionSource(platform=Platform(platform), **kw)
+    return store, adapter
+
+
 def _seeded_source(store):
     store.get_or_create_session.assert_called_once()
     return store.get_or_create_session.call_args[0][0]
@@ -30,9 +42,7 @@ def _seeded_source(store):
 def test_dm_thread_seed_key_matches_dm_reply_key():
     """A brief threaded under a Slack DM must seed the same session row a
     DM in-thread reply resolves to (chat_type='dm', not 'thread')."""
-    store = MagicMock()
-    adapter = MagicMock()
-    adapter._session_store = store
+    store, adapter = _fake_seed_adapter("slack")
 
     with patch("gateway.mirror.mirror_to_session", return_value=True):
         _seed_cron_thread_session(
@@ -60,9 +70,7 @@ def test_channel_thread_seed_key_matches_thread_reply_key():
     """A Slack channel thread reply keys on the parent channel's type
     (``group`` — the adapter's ``build_source`` shape, #111896), not on a
     ``thread`` slot; the seed must match it."""
-    store = MagicMock()
-    adapter = MagicMock()
-    adapter._session_store = store
+    store, adapter = _fake_seed_adapter("slack")
 
     with patch("gateway.mirror.mirror_to_session", return_value=True):
         _seed_cron_thread_session(
@@ -86,9 +94,7 @@ def test_channel_thread_seed_key_matches_thread_reply_key():
 def test_matrix_room_thread_seed_key_matches_room_reply_key():
     """The Matrix adapter keys an in-thread reply on the ROOM's type (``group``), so a
     cron ``attach_to_session`` seed typed ``thread`` is a row no reply ever hits (#112918)."""
-    store = MagicMock()
-    adapter = MagicMock()
-    adapter._session_store = store
+    store, adapter = _fake_seed_adapter("matrix")
 
     with patch("gateway.mirror.mirror_to_session", return_value=True):
         _seed_cron_thread_session(
@@ -111,9 +117,7 @@ def test_dm_seed_default_is_backward_compatible():
     """Callers that don't pass is_dm keep today's thread-keyed behavior —
     the new parameter must not silently rekey non-DM call sites (Discord
     keys an in-thread reply on the ``thread`` slot)."""
-    store = MagicMock()
-    adapter = MagicMock()
-    adapter._session_store = store
+    store, adapter = _fake_seed_adapter("discord")
 
     with patch("gateway.mirror.mirror_to_session", return_value=True):
         _seed_cron_thread_session(
@@ -127,9 +131,7 @@ def test_telegram_forum_topic_seed_key_matches_topic_reply_key():
     """The Telegram adapter types every supergroup message ``group`` (forum topics included), so a
     forum-topic cron seed typed ``thread`` is a row no topic reply ever resolves to — the same
     shape as the Matrix bug, on the sibling platform."""
-    store = MagicMock()
-    adapter = MagicMock()
-    adapter._session_store = store
+    store, adapter = _fake_seed_adapter("telegram")
 
     with patch("gateway.mirror.mirror_to_session", return_value=True):
         _seed_cron_thread_session(
@@ -151,9 +153,7 @@ def test_scoped_dm_thread_seed_key_matches_scoped_reply_key():
     it creates agent:main:slack:dm:<chat>:<thread> while the real reply keys
     agent:main:slack:dm:<team>:<chat>:<thread> — a row no scoped reply ever
     resolves to. The seed must carry the origin's scope_id."""
-    store = MagicMock()
-    adapter = MagicMock()
-    adapter._session_store = store
+    store, adapter = _fake_seed_adapter("slack")
 
     with patch("gateway.mirror.mirror_to_session", return_value=True):
         _seed_cron_thread_session(
@@ -179,9 +179,7 @@ def test_scoped_dm_thread_seed_key_matches_scoped_reply_key():
 
 
 def test_scoped_channel_thread_seed_key_matches_scoped_reply_key():
-    store = MagicMock()
-    adapter = MagicMock()
-    adapter._session_store = store
+    store, adapter = _fake_seed_adapter("slack")
 
     with patch("gateway.mirror.mirror_to_session", return_value=True):
         _seed_cron_thread_session(
@@ -205,9 +203,7 @@ def test_scoped_channel_thread_seed_key_matches_scoped_reply_key():
 
 def test_scoped_flat_channel_seed_key_matches_scoped_reply_key():
     """The flat in_channel seed must reproduce the scoped key too."""
-    store = MagicMock()
-    adapter = MagicMock()
-    adapter._session_store = store
+    store, adapter = _fake_seed_adapter("slack")
 
     with patch("gateway.mirror.mirror_to_session", return_value=True):
         _seed_cron_channel_session(
@@ -235,9 +231,7 @@ def test_seeds_do_not_collide_across_workspaces():
     prevent."""
     keys = []
     for team in ("T0AAAA111", "T0BBBB222"):
-        store = MagicMock()
-        adapter = MagicMock()
-        adapter._session_store = store
+        store, adapter = _fake_seed_adapter("slack")
         with patch("gateway.mirror.mirror_to_session", return_value=True):
             _seed_cron_channel_session(
                 {"id": f"j-{team}"}, adapter, "slack",
