@@ -209,7 +209,8 @@ def _background_delete_gate(store, action, operations, target="memory", content=
             "success": True, "staged": True, "proposal_staged": True, "pending_id": record["id"],
             "message": ("Background review may not delete memory entries unattended. The proposed "
                         f"{'batch' if operations is not None else action} was staged for your approval — "
-                        "review it with /memory pending (approve to apply, discard to drop)."),
+                        f"{wa.pending_count(wa.MEMORY)} pending write(s) now await review at /memory pending "
+                        "(approve to apply, discard to drop)."),
         }, ensure_ascii=False)
     except Exception:
         logger.warning("Failed to stage background-review consolidation; denying", exc_info=True)
