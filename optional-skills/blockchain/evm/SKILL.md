@@ -193,7 +193,12 @@ Shows gwei price + USD cost for: transfer, ERC-20 transfer, approve, swap, NFT m
 - Public RPCs may throttle. Set EVM_RPC_URL to a private endpoint for production.
 - `wallet` and `allowance` only check known token list (~30 tokens per chain). Use a block explorer for complete token discovery.
 - `activity` scans recent blocks only (max 200). For full history, use Etherscan API.
-- `multichain` runs 8 parallel threads — can trigger rate limits on public RPCs.
+- `multichain` runs 8 parallel threads — can trigger rate limits on public RPCs. It stops
+  waiting after `SCAN_BUDGET_S` (180s) and reports unfinished chains as `timeout`; raise the
+  constant if you scan over a slow link.
+- CoinGecko's free tier throttles hard. Prices are cached per run and, once a request is
+  throttled, pricing is switched off for the rest of that run: `value_usd` and
+  `grand_total_usd` come back `null` while every balance stays correct. Re-run a minute later.
 - ENS resolution depends on a single public endpoint (ensideas.com / ens.vitalik.ca) with no fallback. If that endpoint is down, `ens` will fail — re-run later or use a block explorer.
 - Tx decoding depends on a single public endpoint (4byte.directory) with no fallback. Selectors not in their database show up as `unknown`.
 - **L2 gas estimates are L2-execution only.** On rollups like Base, Arbitrum, Optimism, and zkSync, the actual transaction cost also includes an L1 data-posting fee that depends on calldata size and current L1 gas prices. The `gas` command does not estimate that L1 component. For Base specifically, see the network's L1 fee oracle (contract `0x420000000000000000000000000000000000000F`).
