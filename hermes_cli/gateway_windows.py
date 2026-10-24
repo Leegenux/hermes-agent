@@ -1863,11 +1863,15 @@ def _wait_for_gateway_absent(timeout_s: float = 30.0, interval_s: float = 0.5) -
 
 
 def _mark_planned_restart() -> None:
-    """Stamp the planned-restart marker before ``stop()``.
+    """Stamp the planned-restart marker once the old gateway is gone, before ``start()``.
 
     Windows has no SIGUSR1, so ``restart()`` is stop + start: the gateway never runs the in-band
     restart path that stamps this marker itself, and the next boot would read a plain stop and skip
     the "Gateway online" home-channel notice.
+
+    Not before ``stop()``: the old process stays alive until its planned-stop watcher notices, and
+    for that window a flapping platform can reconnect, replay the notice and unlink the marker the
+    new process then never finds.
     """
     from gateway.restart_notice import write_planned_restart_marker
     write_planned_restart_marker()
@@ -1879,7 +1883,6 @@ def restart() -> None:
     replaces it when it exits (a silent outage). Fails loudly on either side."""
     _assert_windows()
 
-    _mark_planned_restart()
     stop()
 
     if not _wait_for_gateway_absent(timeout_s=30.0):
@@ -1894,6 +1897,7 @@ def restart() -> None:
     from hermes_cli.gateway import _wait_for_api_server_port_free  # avoid circular init
 
     _wait_for_api_server_port_free()
+    _mark_planned_restart()
     start()
 
     if not _wait_for_gateway_ready(timeout_s=15.0):

@@ -23,12 +23,15 @@ logger = logging.getLogger(__name__)
 PLANNED_RESTART_MARKER_FILENAME = ".restart_pending.json"
 
 
-def planned_restart_marker_path() -> Path:
-    return get_process_hermes_home() / PLANNED_RESTART_MARKER_FILENAME
+def planned_restart_marker_path(home: Path | None = None) -> Path:
+    return (home or get_process_hermes_home()) / PLANNED_RESTART_MARKER_FILENAME
 
 
-def write_planned_restart_marker() -> None:
+def write_planned_restart_marker(*, via_service: bool = False, detached: bool = False) -> None:
     """Record that the running gateway is going down FOR A RESTART; never blocks the restart.
+
+    One writer for both restart kinds: the gateway's own in-band shutdown (``via_service`` /
+    ``detached`` from its shutdown context) and the CLI, which has no in-band path of its own.
 
     Best-effort like ``gateway.status.write_planned_stop_marker``: an unwritable home costs the
     notice, not the restart. Wider than ``OSError`` on purpose — a marker write that raises for any
@@ -37,7 +40,11 @@ def write_planned_restart_marker() -> None:
     try:
         atomic_json_write(
             planned_restart_marker_path(),
-            {"requested_at": time.time(), "via_service": False, "detached": False},
+            {
+                "requested_at": time.time(),
+                "via_service": bool(via_service),
+                "detached": bool(detached),
+            },
             indent=None,
         )
     except Exception:
