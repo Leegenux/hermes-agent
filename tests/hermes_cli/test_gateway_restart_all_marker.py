@@ -22,7 +22,7 @@ def hermes_home(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_restart_all_stamps_the_marker_before_the_host_is_stopped(hermes_home, monkeypatch):
+def test_restart_all_stamps_the_marker_after_the_host_is_stopped(hermes_home, monkeypatch):
     from hermes_cli import gateway as gw
 
     marker = hermes_home / ".restart_pending.json"
@@ -37,7 +37,7 @@ def test_restart_all_stamps_the_marker_before_the_host_is_stopped(hermes_home, m
     monkeypatch.setattr(gw, "_discard_dead_host_record", lambda: None)
     monkeypatch.setattr(gw, "_forget_host_gateway_probe", lambda: None)
     monkeypatch.setattr(gw, "_installed_service_kind_for", lambda windows: "systemd")
-    monkeypatch.setattr(gw, "_service_call", lambda kind, verb, system: None)
+    monkeypatch.setattr(gw, "_service_call", lambda kind, verb, system: seen.setdefault("marker_at_start", marker.exists()))
     monkeypatch.setattr(gw, "is_windows", False)
 
     owner = SimpleNamespace(pid=4242, profiles=["default"], home=hermes_home, describe=lambda: "host")
@@ -47,5 +47,5 @@ def test_restart_all_stamps_the_marker_before_the_host_is_stopped(hermes_home, m
     # The verb itself, exactly as the CLI dispatches it.
     gw._restart_all(system=False)
 
-    assert seen["marker_at_stop"] is True, "the host must be stopped with the notice already owed"
-    assert marker.exists(), "the restarted host's boot pass reads this marker"
+    assert seen["marker_at_stop"] is False, "the still-draining old host must not see the marker"
+    assert seen["marker_at_start"] is True, "the restarted host's boot pass reads this marker"

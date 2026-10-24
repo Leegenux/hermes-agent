@@ -51,12 +51,13 @@ def restart_all_verb_scope(owner):
 
     The verb stops the host with a service call or a SIGTERM, so the old process never runs the
     in-band restart path that stamps the planned-restart marker; without it the next boot reads a
-    plain stop and every home channel stays silent — #142515's gap, on every OS.
+    plain stop and every home channel stays silent — #142515's gap, on every OS. Yields the stamp
+    for the caller to run once the old host is gone and before the start: a marker written while the
+    old host still drains can be replayed and unlinked by it, and the new host then boots silent.
     """
     from gateway.restart_notice import write_planned_restart_marker
     with host_scope_for_all_verb(owner):
-        write_planned_restart_marker()
-        yield
+        yield write_planned_restart_marker
 
 
 def profile_lifecycle(command: str, args) -> bool:
