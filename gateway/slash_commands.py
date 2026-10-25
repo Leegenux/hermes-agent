@@ -560,7 +560,14 @@ class GatewaySlashCommandsMixin(
             if any(work):
                 labels = ("agent", "cron", "api", "deferred")
                 breakdown = ", ".join(f"{n} {label}" for label, n in zip(labels, work) if n)
-                return t("gateway.restart.blocked", count=sum(work), breakdown=breakdown)
+                # Counts stay out of the catalog sentence, on purpose: a count noun needs CLDR plural
+                # agreement (ar has six categories, ru/uk three) and t() selects no plural form, so a
+                # translated "3 task(s)" can only be wrong. The catalog's existing `_one`/`_other` rule
+                # picks one of two forms on `count == 1`, which cannot express six either. The detail
+                # line is code-built labels no catalog translates, and keeping it on its own line keeps
+                # an LTR run out of an RTL sentence, where the bidi algorithm reorders it around the
+                # sentence's punctuation.
+                return f"{t('gateway.restart.blocked')}\n{breakdown}"
 
         async def _write_marker(name: str, build, label: str) -> None:
             try:
