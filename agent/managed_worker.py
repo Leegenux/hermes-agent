@@ -457,19 +457,24 @@ def _claim_stdin_control():
     DLL init that probes stdin (libgfortran's ``init_units`` inside numpy's OpenBLAS, reached from
     ``mem0 -> qdrant_client -> numpy``) then waits on that lock forever (#142271). The owner sends
     nothing until the worker reports ready, so the parked read never completes.
+
+    The returned stream is this process's for its whole life: the reader may still be parked in it
+    when the process ends, so nothing closes it (a close would hand its fd number to the next open).
     """
     stream = os.fdopen(os.dup(sys.stdin.fileno()), 'rb')  # windows-footgun: ok — binary control frames
     if sys.platform == 'win32':
-        devnull = os.open(os.devnull, os.O_RDONLY)
-        os.dup2(devnull, sys.stdin.fileno())  # windows-footgun: ok — the private dup above owns the pipe
-        os.close(devnull)
+        try:
+            with open(os.devnull, 'rb') as devnull:
+                os.dup2(devnull.fileno(), sys.stdin.fileno())  # windows-footgun: ok — the private dup above owns the pipe
+        except BaseException:
+            stream.close()  # fd 0 still on the control pipe: give the dup back instead of leaking it while raising
+            raise
     return stream
 
 
 def main():
     channel = WorkerChannel(os.fdopen(os.dup(sys.stdout.fileno()), 'wb', buffering=0))  # windows-footgun: ok — binary frames
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
-    controls_in = _claim_stdin_control()
     # This process's own stderr only, never the channel. The owner drains it into the profile's
     # private managed-worker.log, redacting each line (patterns plus this worker's launch key and
     # assignment secret) before it reaches disk; this process never opens a profile log itself.
@@ -478,6 +483,9 @@ def main():
     logger.propagate = False
     try:
         channel.send('hello', **hello())
+        # Claimed inside the try so a failure still reaches the owner as an error frame instead of a
+        # silent death; nothing reads stdin before this point, so the deadlock window is unchanged.
+        controls_in = _claim_stdin_control()
         frame = validate_bootstrap(read_frame(controls_in))
         execute(frame, channel, controls_in)
     except Exception:

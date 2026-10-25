@@ -9,6 +9,7 @@ import io
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -116,3 +117,144 @@ def test_each_claim_owns_a_distinct_fd_and_releases_it(monkeypatch):
     for fd in owned:
         with pytest.raises(OSError):
             os.fstat(fd)
+
+
+# Runs in a child interpreter: main() dups stderr over this process's stdout and mutates fd 0. The
+# child replaces hello/execute so only the wiring under test runs; probes report on stderr.
+_WIRING_PROBE = """
+import sys
+import agent.managed_worker as mw
+
+mw.hello = lambda: {}
+mw.validate_bootstrap = lambda frame: frame
+
+
+def fake_execute(frame, channel, controls_in=None):
+    if controls_in is None:
+        print("stream=missing", file=sys.stderr, flush=True)
+        return
+    print("stream=claimed", file=sys.stderr, flush=True)
+    print("control=%s" % mw.read_frame(controls_in)["n"], file=sys.stderr, flush=True)
+
+
+mw.execute = fake_execute
+raise SystemExit(mw.main())
+"""
+
+
+_FAILING_CLAIM_PROBE = """
+import agent.managed_worker as mw
+
+mw.hello = lambda: {}
+
+
+def _boom():
+    raise OSError('dup2 refused')
+
+
+mw._claim_stdin_control = _boom
+raise SystemExit(mw.main())
+"""
+
+
+def _active_fd_count():
+    """Handles this process holds: psutil counts descriptors off Windows; Windows has neither
+    ``num_fds`` nor ``/proc/self/fd``, so it asks the kernel for the handle count."""
+    if sys.platform == 'win32':
+        import ctypes
+        import ctypes.wintypes
+        kernel32 = ctypes.windll.kernel32
+        count = ctypes.wintypes.DWORD()
+        kernel32.GetCurrentProcess.restype = ctypes.wintypes.HANDLE  # int default truncates the pseudo-handle
+        kernel32.GetProcessHandleCount.argtypes = [ctypes.wintypes.HANDLE, ctypes.POINTER(ctypes.wintypes.DWORD)]
+        assert kernel32.GetProcessHandleCount(kernel32.GetCurrentProcess(), ctypes.byref(count))
+        return count.value
+    import psutil
+    return psutil.Process().num_fds()
+
+
+def test_main_hands_the_claimed_stream_to_the_worker_controls():
+    """The claim is only wired if execute() receives it: the bootstrap and the first control frame
+    both come off that one stream (two streams would lose the frame read ahead by the bootstrap)."""
+    proc = subprocess.run(
+        [sys.executable, '-c', _WIRING_PROBE], cwd=REPO_ROOT,
+        input='{"type": "bootstrap"}\n{"n": 42}\n', capture_output=True, text=True, timeout=180, check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    seen = dict(line.split('=', 1) for line in proc.stderr.splitlines() if '=' in line)
+    assert seen.get('stream') == 'claimed', 'execute() was not handed the claimed stream'
+    assert seen.get('control') == '42', 'the bootstrap read swallowed the control frame'
+
+
+def test_a_failed_claim_still_reports_to_the_owner():
+    """The claim runs inside main()'s try: its failure becomes an error frame instead of the silent
+    worker death this PR exists to remove."""
+    proc = subprocess.run(
+        [sys.executable, '-c', _FAILING_CLAIM_PROBE], cwd=REPO_ROOT,
+        input=b'', capture_output=True, timeout=180, check=False,
+    )
+    assert proc.returncode == 1, proc.stdout
+    assert b'"type":"hello"' in proc.stdout, 'the owner never saw hello'
+    assert b'"type":"error"' in proc.stdout, 'a failed claim died silently'
+
+
+def test_control_frame_written_while_the_reader_is_parked_is_delivered():
+    """The owner may write at any moment, including mid-read: a parked reader must still consume it."""
+    read_fd, write_fd = os.pipe()
+    stream = os.fdopen(read_fd, 'rb')
+
+    class _Channel:
+        def send(self, *args, **kwargs):
+            raise AssertionError('the reader only sends while shutting down')
+
+    controls = WorkerControls(_Channel(), 'route', stream)
+    try:
+        time.sleep(0.2)  # the reader is inside readline with the pipe still empty
+        assert controls.reader.is_alive() and not controls.finish.is_set()
+        os.write(write_fd, b'{"type": "finish"}\n')
+        assert controls.finish.wait(timeout=30), 'a frame written into a parked read never arrived'
+    finally:
+        if controls.reader.is_alive():  # unwedge it: an EOF here arms the 10s owner-death kill
+            os.write(write_fd, b'{"type": "finish"}\n')
+            controls.finish.wait(timeout=30)
+        os.close(write_fd)
+        stream.close()
+
+
+@pytest.mark.platforms('linux', 'macos')
+def test_claim_reads_control_frames_from_a_tty_stdin(monkeypatch):
+    """A worker whose stdin is a terminal has no pipe to dup; the frames must still arrive."""
+    import pty
+    master_fd, slave_fd = pty.openpty()
+    monkeypatch.setattr(sys, 'stdin', _FakeStdin(slave_fd))
+    stream = _claim_stdin_control()
+    try:
+        os.write(master_fd, b'{"n": 9}\n')
+        assert read_frame(stream)['n'] == 9
+    finally:
+        stream.close()
+        os.close(slave_fd)
+        os.close(master_fd)
+
+
+def test_a_failed_claim_hands_its_handles_back(monkeypatch):
+    """If the fd-0 swap cannot happen the worker still has to raise (the owner gets an error frame),
+    so the dup and the NUL handle must be gone by then."""
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(sys, 'stdin', _FakeStdin(read_fd))
+    monkeypatch.setattr(sys, 'platform', 'win32')
+
+    real_dup2 = os.dup2
+
+    def _refuse(fd, target):
+        if target == read_fd:
+            raise OSError('dup2 refused')
+        return real_dup2(fd, target)  # pytest's capture restore between phases is not our target
+
+    monkeypatch.setattr(os, 'dup2', _refuse)
+    before = _active_fd_count()
+    with pytest.raises(OSError):
+        _claim_stdin_control()
+    assert _active_fd_count() <= before, 'the failed claim leaked a handle'
+    os.close(read_fd)
+    os.close(write_fd)
