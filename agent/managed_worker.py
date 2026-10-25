@@ -175,8 +175,9 @@ def _die_with_owner():
 
 
 class WorkerControls:
-    def __init__(self, channel, route):
+    def __init__(self, channel, route, stream=None):
         self.channel, self.route = channel, route
+        self.stream = stream if stream is not None else sys.stdin.buffer
         self.agent = None
         self.stopped = threading.Event()
         self.finish = threading.Event()
@@ -199,7 +200,7 @@ class WorkerControls:
         from tools.approval import resolve_gateway_approval
         try:
             while True:
-                frame = read_frame(sys.stdin.buffer)
+                frame = read_frame(self.stream)
                 if frame == {'type': 'stop'}:
                     self.stop()
                     continue
@@ -327,7 +328,7 @@ def tool_frame(call_id, name, args, *result):
     return json.loads(json.dumps(frame, default=str))
 
 
-def execute(frame, channel):
+def execute(frame, channel, controls_in=None):
     # The owner RPC below imports gateway/config modules (hermes_cli.config, providers,
     # hermes_cli.plugins) transitively; the policy must already be frozen when they load.
     bind_worker_policy(frame)
@@ -356,7 +357,7 @@ def execute(frame, channel):
     os.environ['HERMES_GATEWAY_SESSION'] = '1'
     from gateway.session_worker_construct import checkpoint_agent_kwargs, construct_kwargs, routing_agent_kwargs
     construct = {'ephemeral_system_prompt': policy.skills_prompt, **construct_kwargs(frame)}
-    controls = WorkerControls(channel, frame['route'])
+    controls = WorkerControls(channel, frame['route'], controls_in)
     register_gateway_notify(frame['route'], controls.approval)
     agent = None
     try:
@@ -449,9 +450,26 @@ def hello():
     return {'pid': me.pid, 'birth': worker_birth(me), 'ancestors': [p.pid for p in me.parents()[:3]]}
 
 
+def _claim_stdin_control():
+    """Control frames come from a private dup of stdin, and on Windows fd 0 is left on NUL.
+
+    A blocking read on fd 0 holds the UCRT per-fd lock for the whole time it waits, and any native
+    DLL init that probes stdin (libgfortran's ``init_units`` inside numpy's OpenBLAS, reached from
+    ``mem0 -> qdrant_client -> numpy``) then waits on that lock forever (#142271). The owner sends
+    nothing until the worker reports ready, so the parked read never completes.
+    """
+    stream = os.fdopen(os.dup(sys.stdin.fileno()), 'rb')  # windows-footgun: ok — binary control frames
+    if sys.platform == 'win32':
+        devnull = os.open(os.devnull, os.O_RDONLY)
+        os.dup2(devnull, sys.stdin.fileno())  # windows-footgun: ok — the private dup above owns the pipe
+        os.close(devnull)
+    return stream
+
+
 def main():
     channel = WorkerChannel(os.fdopen(os.dup(sys.stdout.fileno()), 'wb', buffering=0))  # windows-footgun: ok — binary frames
     os.dup2(sys.stderr.fileno(), sys.stdout.fileno())
+    controls_in = _claim_stdin_control()
     # This process's own stderr only, never the channel. The owner drains it into the profile's
     # private managed-worker.log, redacting each line (patterns plus this worker's launch key and
     # assignment secret) before it reaches disk; this process never opens a profile log itself.
@@ -460,8 +478,8 @@ def main():
     logger.propagate = False
     try:
         channel.send('hello', **hello())
-        frame = validate_bootstrap(read_frame(sys.stdin.buffer))
-        execute(frame, channel)
+        frame = validate_bootstrap(read_frame(controls_in))
+        execute(frame, channel, controls_in)
     except Exception:
         # Runtime exceptions can contain credentials; the owner gets no raw traceback.
         logger.exception('managed worker failed')
