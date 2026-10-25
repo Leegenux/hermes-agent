@@ -552,6 +552,16 @@ class GatewaySlashCommandsMixin(
             count = self._running_agent_count()
             return t("gateway.draining", count=count) if count else EphemeralReply(t("gateway.restart.in_progress"))
 
+        # Surface parity with the CLI's live-work guard (hermes_cli/gateway_lifecycle_guards):
+        # in-chat /restart used to start the drain unannounced, so a busy gateway looked hung for up
+        # to restart_after_turn_timeout. Name the work; `/restart force` is the existing escape hatch.
+        if "force" not in (event.get_command_args() or "").lower().split():
+            work = self._drain_work_counts()
+            if any(work):
+                labels = ("agent", "cron", "api", "deferred")
+                breakdown = ", ".join(f"{n} {label}" for label, n in zip(labels, work) if n)
+                return t("gateway.restart.blocked", count=sum(work), breakdown=breakdown)
+
         async def _write_marker(name: str, build, label: str) -> None:
             try:
                 await asyncio.to_thread(atomic_json_write, _hermes_home / name, build(), indent=None)
