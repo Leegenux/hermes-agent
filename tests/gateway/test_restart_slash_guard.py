@@ -40,6 +40,8 @@ async def test_restart_with_live_work_names_it_and_does_not_restart():
 
     assert result == t("gateway.restart.blocked", count=3, breakdown="2 agent, 1 cron")
     assert result != "gateway.restart.blocked"  # catalog resolved, not the bare key
+    assert "3" in result and "2 agent, 1 cron" in result  # count reached the text, not just kwargs
+    assert result != t("gateway.restart.restarting")  # never the idle wording
     runner.request_restart.assert_not_called()
 
 
@@ -60,6 +62,26 @@ async def test_restart_with_no_live_work_still_restarts():
     runner.request_restart = MagicMock(return_value=True)
     runner._drain_work_counts = MagicMock(return_value=(0, 0, 0, 0))
 
-    await runner._handle_message(_event("/restart"))
+    result = await runner._handle_message(_event("/restart"))
 
     runner.request_restart.assert_called_once()
+    assert result == t("gateway.restart.restarting")
+    # No work is draining, so the reply must not claim any: no blocked template, no task noun.
+    assert "task(s)" not in result
+
+
+@pytest.mark.asyncio
+async def test_zero_and_live_work_wording_differ():
+    # The whole point of the guard: an idle /restart and a busy /restart must not read alike.
+    idle_runner, _ = make_restart_runner()
+    idle_runner.request_restart = MagicMock(return_value=True)
+    idle_runner._drain_work_counts = MagicMock(return_value=(0, 0, 0, 0))
+    idle = await idle_runner._handle_message(_event("/restart"))
+
+    busy_runner, _ = make_restart_runner()
+    busy_runner.request_restart = MagicMock(return_value=True)
+    busy_runner._drain_work_counts = MagicMock(return_value=(4, 0, 0, 0))
+    busy = await busy_runner._handle_message(_event("/restart"))
+
+    assert idle != busy
+    assert "4" in busy and "4" not in idle
