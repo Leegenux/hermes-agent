@@ -44,7 +44,7 @@ async def test_restart_command_while_busy_names_the_work_instead_of_restarting(m
 
     result = await runner._handle_message(event)
 
-    expected = t("gateway.restart.blocked", count=1, breakdown="1 agent")
+    expected = f"{t('gateway.restart.blocked')}\n1 agent"
     assert result == expected
     # Guard against the silent-degradation regression in #22266: if the i18n
     # catalog cannot be resolved (e.g. workers losing the locales path)

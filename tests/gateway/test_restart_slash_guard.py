@@ -46,9 +46,9 @@ async def test_restart_with_live_work_names_it_and_does_not_restart():
 
     result = await runner._handle_message(_event("/restart"))
 
-    assert result == t("gateway.restart.blocked", count=3, breakdown="2 agent, 1 cron")
-    assert result != "gateway.restart.blocked"  # catalog resolved, not the bare key
-    assert "3" in result and "2 agent, 1 cron" in result  # count reached the text, not just kwargs
+    assert result == f"{t('gateway.restart.blocked')}\n2 agent, 1 cron"
+    assert not result.startswith("gateway.restart.blocked")  # catalog resolved, not the bare key
+    assert "2 agent, 1 cron" in result  # the breakdown reached the text, not just kwargs
     assert result != t("gateway.restart.restarting")  # never the idle wording
     runner.request_restart.assert_not_called()
 
@@ -121,6 +121,6 @@ async def test_restart_reply_stays_in_the_command_thread(platform, chat_type, th
     # The reply the user sees is the blocked-work notice, sent to the command's thread.
     assert adapter.sent_calls[-1] == (
         event.source.chat_id,
-        t("gateway.restart.blocked", count=1, breakdown="1 agent"),
+        f"{t('gateway.restart.blocked')}\n1 agent",
         {"thread_id": thread_id, "notify": True},
     )
