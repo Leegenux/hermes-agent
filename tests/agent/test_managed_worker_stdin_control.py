@@ -6,13 +6,14 @@ so any native DLL init that probes stdin cannot wait on the parked read.
 """
 
 import io
+import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from agent.managed_worker import WorkerControls
+from agent.managed_worker import WorkerControls, _claim_stdin_control, read_frame
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -63,3 +64,55 @@ def test_worker_controls_reads_the_given_stream():
 
     controls = WorkerControls(_Channel(), "route", io.BytesIO(b'{"type": "finish"}\n'))
     assert controls.finish.wait(timeout=30), "finish frame was never consumed"
+
+
+class _FakeStdin:
+    """Only ``fileno()`` is used by the claim, so the test can hand it its own pipe."""
+
+    def __init__(self, fd):
+        self._fd = fd
+
+    def fileno(self):
+        return self._fd
+
+
+def test_the_posix_branch_leaves_fd0_alone_and_still_reads_frames(monkeypatch):
+    """The fd-0 surgery is the Windows workaround; off Windows the owner's stdin stays intact."""
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(read_fd))
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    stream = _claim_stdin_control()
+    try:
+        os.fstat(read_fd)  # still the owner's pipe, not replaced or closed
+        assert stream.fileno() != read_fd, "the claim re-used the owner's descriptor"
+        os.write(write_fd, b'{"n": 11}\n{"n": 12}\n')
+        assert read_frame(stream)["n"] == 11
+        assert read_frame(stream)["n"] == 12
+    finally:
+        stream.close()
+        os.close(read_fd)
+        os.close(write_fd)
+
+
+def test_each_claim_owns_a_distinct_fd_and_releases_it(monkeypatch):
+    """Two claims must not share one fd, and closing a stream must give the fd back (no leak)."""
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(sys, "stdin", _FakeStdin(read_fd))
+    monkeypatch.setattr(sys, "platform", "linux")
+
+    first = _claim_stdin_control()
+    second = _claim_stdin_control()
+    owned = (first.fileno(), second.fileno())
+    try:
+        assert len(set(owned)) == 2, "both claims share one descriptor"
+        assert read_fd not in owned, "a claim handed out the owner's own descriptor"
+    finally:
+        first.close()
+        second.close()
+        os.close(read_fd)
+        os.close(write_fd)
+
+    for fd in owned:
+        with pytest.raises(OSError):
+            os.fstat(fd)
