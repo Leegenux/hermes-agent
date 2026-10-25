@@ -332,6 +332,7 @@ gateway:
   restart:
     in_progress: "⏳ إعادة تشغيل البوابة قيد التنفيذ بالفعل..."
     restarting: "♻ جارٍ إعادة تشغيل البوابة. إن لم تُخطَر خلال 60 ثانية، أعِد التشغيل من وحدة التحكّم باستخدام `hermes gateway restart`."
+    blocked: "⚠️ Not restarting: {count} task(s) still running ({breakdown}). Send `/restart force` to restart anyway — in-flight work is interrupted."
   resume:
     db_unavailable: "قاعدة بيانات الجلسات غير متاحة."
     parse_error: "⚠️ تعذّر تحليل وسائط `/resume`: {error}.\nاستخدم علامات اقتباس حول العناوين التي تحتوي مسافات، مثال: `/resume \"Project A Plan\"`."
