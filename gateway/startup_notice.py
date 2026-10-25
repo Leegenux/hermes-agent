@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
+import os
 import time
 from pathlib import Path
 from typing import Optional
@@ -23,12 +25,34 @@ from typing import Optional
 from hermes_constants import get_process_hermes_home
 from utils import atomic_json_write
 
+logger = logging.getLogger(__name__)
+
 STARTUP_NOTICE_FILENAME = ".startup_notice.json"
 MIN_INTERVAL_SECONDS = 300.0
 
 
 def startup_notice_path() -> Path:
     return get_process_hermes_home() / STARTUP_NOTICE_FILENAME
+
+
+def another_gateway_owns_this_home(*, home: Optional[Path] = None) -> bool:
+    """True when a DIFFERENT live process owns this home's gateway: an attach, not a new start.
+
+    Reuses the canonical liveness matcher (``gateway.status.live_gateway_pid_for_home``: pid record
+    + start-time reuse guard + a live command line belonging to this home, never bare PID
+    existence) instead of a second probe. The upstream ``gateway.host_attach`` decision already
+    keeps a CLI from spawning a second gateway; this answers the same question at the notice, so
+    no boot path can announce a start it did not make. Any probe failure answers True — an
+    unanswerable probe must stay silent rather than announce twice.
+    """
+    try:
+        from gateway.status import live_gateway_pid_for_home
+
+        pid = live_gateway_pid_for_home(Path(home or get_process_hermes_home()))
+    except Exception:
+        logger.debug("Gateway-owner probe failed; suppressing the startup notice", exc_info=True)
+        return True
+    return pid is not None and pid != os.getpid()
 
 
 def last_notice_at(*, path: Optional[Path] = None) -> Optional[float]:
