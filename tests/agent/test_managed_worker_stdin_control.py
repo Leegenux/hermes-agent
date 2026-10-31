@@ -270,15 +270,17 @@ import sys, threading, time
 from agent.managed_worker import _claim_stdin_control
 
 stream = _claim_stdin_control()
-threading.Thread(target=lambda: stream.read(1), daemon=True).start()
+reader = threading.Thread(target=lambda: stream.read(1), daemon=True)
+reader.start()
 time.sleep(0.5)
+print("parked", reader.is_alive(), flush=True)
 import numpy
 print("imported", flush=True)
 """
 
 
 @pytest.mark.platforms("windows")
-def test_a_native_import_does_not_deadlock_behind_the_parked_reader():
+def test_a_native_import_does_not_deadlock_behind_the_parked_reader(tmp_path):
     """A parked control read must not hold fd 0 while a native DLL init probes stdin.
 
     The deadlock is host-specific: on some Windows builds the child never returns, on others the
@@ -290,14 +292,21 @@ def test_a_native_import_does_not_deadlock_behind_the_parked_reader():
     if probe.returncode != 0:
         pytest.skip("numpy is not importable in this interpreter")
 
-    proc = subprocess.Popen([sys.executable, "-c", _NATIVE_IMPORT_PROBE], cwd=REPO_ROOT,
-                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True)
-    try:
-        out, err = proc.communicate(timeout=120)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.communicate()
-        pytest.fail("the child deadlocked: a parked control read blocked numpy's native import")
-    assert proc.returncode == 0, err
-    assert "imported" in out, out
+    log = tmp_path / "child.log"
+    with log.open("w", encoding="utf-8", errors="replace") as out:
+        proc = subprocess.Popen([sys.executable, "-c", _NATIVE_IMPORT_PROBE], cwd=REPO_ROOT,
+                                stdin=subprocess.PIPE, stdout=out, stderr=subprocess.STDOUT, text=True)
+        try:
+            # communicate() would close stdin and hand the parked read an EOF, which is the one shape
+            # that cannot deadlock; wait instead and leave the pipe open until the child is gone.
+            proc.wait(timeout=120)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+            pytest.fail("the child deadlocked behind the parked control read")
+        finally:
+            proc.stdin.close()
+    text = log.read_text(encoding="utf-8", errors="replace")
+    assert "parked True" in text, f"the reader was not parked when the import ran:\n{text}"
+    assert "imported" in text, text
+    assert proc.returncode == 0, text
