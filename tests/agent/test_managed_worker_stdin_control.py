@@ -258,3 +258,43 @@ def test_a_failed_claim_hands_its_handles_back(monkeypatch):
     assert _active_fd_count() <= before, 'the failed claim leaked a handle'
     os.close(read_fd)
     os.close(write_fd)
+
+
+# Runs in a child whose stdin really is a pipe the parent never writes to: the end-to-end shape of
+# #142271 / #143422, with the production claim in front of the native import.
+_NATIVE_IMPORT_PROBE = """
+import sys, threading, time
+from agent.managed_worker import _claim_stdin_control
+
+stream = _claim_stdin_control()
+threading.Thread(target=lambda: stream.read(1), daemon=True).start()
+time.sleep(0.5)
+import numpy
+print("imported", flush=True)
+"""
+
+
+@pytest.mark.platforms("windows")
+def test_a_native_import_does_not_deadlock_behind_the_parked_reader():
+    """A parked control read must not hold fd 0 while a native DLL init probes stdin.
+
+    The deadlock is host-specific: on some Windows builds the child never returns, on others the
+    import completes either way, so this arm is only red where the bug reproduces. It is the only
+    arm here that exercises the real failure shape instead of the invariants around it.
+    """
+    probe = subprocess.run([sys.executable, "-c", "import numpy"], capture_output=True, timeout=180,
+                           check=False)
+    if probe.returncode != 0:
+        pytest.skip("numpy is not importable in this interpreter")
+
+    proc = subprocess.Popen([sys.executable, "-c", _NATIVE_IMPORT_PROBE], cwd=REPO_ROOT,
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True)
+    try:
+        out, err = proc.communicate(timeout=120)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        pytest.fail("the child deadlocked: a parked control read blocked numpy's native import")
+    assert proc.returncode == 0, err
+    assert "imported" in out, out
