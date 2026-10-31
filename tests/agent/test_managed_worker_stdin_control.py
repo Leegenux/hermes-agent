@@ -9,7 +9,7 @@ import io
 import os
 import subprocess
 import sys
-import time
+import threading
 from pathlib import Path
 
 import pytest
@@ -200,25 +200,28 @@ def test_a_failed_claim_still_reports_to_the_owner():
 
 def test_control_frame_written_while_the_reader_is_parked_is_delivered():
     """The owner may write at any moment, including mid-read: a parked reader must still consume it."""
-    read_fd, write_fd = os.pipe()
-    stream = os.fdopen(read_fd, 'rb')
+    parked, release = threading.Event(), threading.Event()
+
+    class _ParkedStream(io.BytesIO):
+        """Hangs inside the first readline until the test releases it, so "parked" is observable."""
+
+        def readline(self, *args):
+            parked.set()
+            release.wait(timeout=30)  # the test releases it; a real pipe would unblock on write
+            return b'{"type": "finish"}\n'
 
     class _Channel:
         def send(self, *args, **kwargs):
             raise AssertionError('the reader only sends while shutting down')
 
-    controls = WorkerControls(_Channel(), 'route', stream)
+    controls = WorkerControls(_Channel(), 'route', _ParkedStream())
     try:
-        time.sleep(0.2)  # the reader is inside readline with the pipe still empty
+        assert parked.wait(timeout=30), 'the reader never parked'
         assert controls.reader.is_alive() and not controls.finish.is_set()
-        os.write(write_fd, b'{"type": "finish"}\n')
-        assert controls.finish.wait(timeout=30), 'a frame written into a parked read never arrived'
+        release.set()
+        assert controls.finish.wait(timeout=30), 'a frame delivered to a parked read never arrived'
     finally:
-        if controls.reader.is_alive():  # unwedge it: an EOF here arms the 10s owner-death kill
-            os.write(write_fd, b'{"type": "finish"}\n')
-            controls.finish.wait(timeout=30)
-        os.close(write_fd)
-        stream.close()
+        release.set()
 
 
 @pytest.mark.platforms('linux', 'macos')
