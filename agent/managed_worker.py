@@ -460,6 +460,8 @@ def _claim_stdin_control():
 
     The returned stream is this process's for its whole life: the reader may still be parked in it
     when the process ends, so nothing closes it (a close would hand its fd number to the next open).
+    Nothing else may learn it either: the lock belongs to the file object, not the handle, so handing
+    this duplicate back to fd 0 (or to any native init) would reproduce the deadlock.
     """
     stream = os.fdopen(os.dup(sys.stdin.fileno()), 'rb')  # windows-footgun: ok — binary control frames
     if sys.platform == 'win32':
