@@ -818,12 +818,20 @@ async def reset_and_rehome_messages(runner, session_key, old_session_id):
     return entry, release
 
 
-async def admit_route_wake(runner, adapter, source, text, producer, metadata=None):
+async def admit_route_wake(runner, adapter, source, text, producer, metadata=None, *,
+                           token=None, return_receipt=False):
     """Commit a producer wake (Kanban push wake, /loop tick) for ``source``'s route into the
     authority FIFO, like heartbeats and process completions, instead of a classic turn that
     interrupts or races the admitted one. ``False`` when no authority serves the scope or the
     route holds no committed human turn to borrow provenance from: the caller keeps the adapter
-    path (nothing is queued there either). Raises ``RuntimeStoreError`` on a refusal."""
+    path (nothing is queued there either). Raises ``RuntimeStoreError`` on a refusal.
+
+    ``token`` is an optional deterministic admission identity component. The native ledger
+    dedupes on the whole identity, so a producer that retries the same logical wake (for example
+    a durable addressed message) replays its committed admission instead of queueing a second
+    turn. ``return_receipt`` returns that admission receipt instead of ``True``; callers that
+    only need admission keep the boolean contract.
+    """
     from gateway.session_authorities import active_authority
     from gateway.session_local_recovery import restore_completion_route
     from gateway.session_detached import detached_live, detached_route_of, route_entry
@@ -834,7 +842,8 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
     if authority is None or entry is None:
         return False
     import uuid
-    identity = json.dumps([producer, key, uuid.uuid4().hex], separators=(',', ':'))
+    identity = json.dumps([producer, key, str(token) if token else uuid.uuid4().hex],
+                          separators=(',', ':'))
     if source.platform == Platform.LOCAL or detached_route_of(source):
         # A local route (or a conversation its chat moved past, answered by its app viewers) has no
         # messaging provenance to borrow: its wake rides local_automation_v1 on the live session's own
@@ -847,8 +856,8 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
                              message_id=identity, metadata={'gateway_session_key': key,
                                                             'gateway_session_id': entry.session_id,
                                                             **(metadata or {})})
-        await authority.admit_automation(adapter, event, identity)
-        return True
+        receipt = await authority.admit_automation(adapter, event, identity)
+        return receipt if return_receipt else True
     from gateway.session_envelope import restore_native
     envelope = committed_route_envelope(authority, entry)
     if envelope is None:
@@ -860,5 +869,5 @@ async def admit_route_wake(runner, adapter, source, text, producer, metadata=Non
                          message_id=identity, metadata={'gateway_session_key': key,
                                                         'gateway_session_id': entry.session_id,
                                                         **(metadata or {})})
-    await authority.admit_automation(adapter, event, identity)
-    return True
+    receipt = await authority.admit_automation(adapter, event, identity)
+    return receipt if return_receipt else True

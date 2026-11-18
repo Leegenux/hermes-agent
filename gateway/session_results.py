@@ -69,7 +69,8 @@ def prepare_result(row, response, outcome, result=None):
     return outcome, _redacted(compact_result(result, user_message=row['payload'].get('text')))
 
 
-def finish_result(db, *, epoch, row, response, outcome, result=None, prepared=None, transfers=None):
+def finish_result(db, *, epoch, row, response, outcome, result=None, prepared=None, transfers=None,
+                  _continuation_authorize=None):
     """Delivery failure cannot rewrite an already committed execution outcome.
 
     `result` is the exact structured result captured in-process; the managed
@@ -103,6 +104,13 @@ def finish_result(db, *, epoch, row, response, outcome, result=None, prepared=No
         notice, display_metadata = refusal
     write = None if notice is None else (lambda conn, _current: close_discarded_turn(
         db, conn, row, notice, replace_after=row.get('transcript_mark'), display_metadata=display_metadata))
+    if outcome == 'completed' and _continuation_authorize is not None:
+        notice_write = write
+        def write(conn, current):
+            if notice_write is not None:
+                notice_write(conn, current)
+            from gateway.completion_report_continuation import queue_unreported_on_conn
+            queue_unreported_on_conn(conn, epoch=epoch, row=row, authorize=_continuation_authorize)
     settled = settle_session_input(db, epoch=epoch, admission_id=row['admission_id'],
         generation=row['generation'], outcome=outcome, result=stored, _transfers=transfers,
         _terminal_write=write)

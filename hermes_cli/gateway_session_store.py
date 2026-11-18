@@ -549,6 +549,9 @@ def move_cli_workspace(cli, wt_info):
 
 
 def session_store():
+    from hermes_cli import cli_local_mode
+    if cli_local_mode.enabled():
+        return cli_local_mode.session_store()
     return GatewaySessionStore()
 
 
@@ -558,6 +561,9 @@ def create_titled_session(title):
     Main's ``_create_titled_session`` minted the id and wrote the row itself, with no cwd stamp
     (``row_cwd`` ""). Returns the id, or None when the gateway refused (the caller prints main's
     "could not be created" copy)."""
+    from hermes_cli import cli_local_mode
+    if cli_local_mode.enabled():
+        return cli_local_mode.create_titled_session(title)
     params = _creation_policy({})
     params["cwd"] = _launch_cwd()
     params["source"] = "cli"  # main's titled row is `cli` (hermes_cli.main._create_titled_session)

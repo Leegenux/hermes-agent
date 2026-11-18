@@ -285,6 +285,8 @@ class TestFirecrawlScrapeTimeout:
         )
 
         p = firecrawl_provider.FirecrawlWebSearchProvider()
+        # The fake scrape must not depend on DNS (local fake-IP resolvers return 198.18/15).
+        monkeypatch.setattr(firecrawl_provider, "is_safe_url", lambda url: True)
         results = asyncio.run(p.extract(["https://example.com"]))
 
         # Verify scrape was called with timeout=60000

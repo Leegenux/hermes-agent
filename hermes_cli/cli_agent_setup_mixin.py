@@ -644,7 +644,11 @@ class CLIAgentSetupMixin:
         """Build the agent on first use; when resuming, restore history from SQLite.
         Returns True on success."""
         from cli import ChatConsole, _cprint, logger
-        from hermes_cli.gateway_agent import GatewayAgent as AIAgent  # the gateway runs the turn
+        from hermes_cli import cli_local_mode
+        if cli_local_mode.enabled():
+            AIAgent = cli_local_mode.build_agent  # this process runs the turn
+        else:
+            from hermes_cli.gateway_agent import GatewayAgent as AIAgent  # the gateway runs the turn
         if self.agent is not None:
             return True
 

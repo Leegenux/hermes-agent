@@ -247,6 +247,9 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
     # ── stream consumer / interim commentary wiring ─────────────────────────────────────────
 
     def _setup_stream_consumer(self, platform_key):
+        from gateway.completion_report_scope import completion_scope
+        if completion_scope.get() is not None:
+            return None, None, None, False
         ctx = self._ctx
         if ctx.mute_notification_reply:
             return None, None, None, False
@@ -485,7 +488,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             if (ctx._voice_ack_guild[0] is not None or ctx._native_slack_task_cards) else None
         )
         agent.tool_complete_callback = ctx.native_tool_complete_callback if ctx._native_slack_task_cards else None
-        if self._approval_owner is not None:
+        if (self._approval_owner is not None
+                or (ctx.tool_progress_enabled and ctx.source.platform == Platform.TELEGRAM)):
             agent.tool_start_callback = self.combined_tool_start_callback
             agent.tool_complete_callback = self.combined_tool_complete_callback
         agent.step_callback = ctx._step_callback_sync if (ctx._hooks_ref.loaded_hooks or self._approval_owner is not None) else None
@@ -632,6 +636,14 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 reply.update(outcome="undelivered" if undelivered else "timed_out", notice=raw)
                 break
             answers[entry["qid"]] = None if raw == SKIPPED else raw
+        if reply['outcome'] in ('timed_out', 'undelivered'):
+            # The batch ended, not the agent turn: expiry must not leave its refresher paused.
+            from gateway.platforms.typing_scope import set_typing_paused
+            ctx = self._ctx
+            current = getattr(ctx, '_run_still_current', None)
+            if ctx._status_adapter and (not callable(current) or current()):
+                set_typing_paused(ctx._status_adapter, ctx._status_chat_id, paused=False,
+                                  metadata=ctx._status_thread_metadata)
         return reply
 
     def _ask_clarify_question(self, question, choices, multi_select, rearm: bool = True) -> tuple[str, bool]:
@@ -668,7 +680,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # Pause typing: a "thinking..." status must not obscure the prompt or block an "Other" reply
         # on platforms that disable input while typing (Slack Assistant).
         with suppress(Exception):
-            ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
+            from gateway.platforms.typing_scope import set_typing_paused
+            set_typing_paused(ctx._status_adapter, ctx._status_chat_id, paused=True, metadata=ctx._status_thread_metadata)
         # Ordering barrier: flush buffered assistant prose BEFORE the poll, which goes out on a
         # separate agent-thread-blocking path and would otherwise render ABOVE its own explanation.
         # Best-effort + short timeout so the agent thread never hangs if the consumer isn't running.
@@ -713,7 +726,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 except Exception:
                     logger.debug("request_reopen_seed after clarify answer failed", exc_info=True)
             try:
-                ctx._status_adapter.resume_typing_for_chat(ctx._status_chat_id)
+                from gateway.platforms.typing_scope import set_typing_paused
+                set_typing_paused(ctx._status_adapter, ctx._status_chat_id, paused=False, metadata=ctx._status_thread_metadata)
             except Exception:
                 logger.debug("resume_typing_for_chat after clarify answer failed", exc_info=True)
         return response, answered
@@ -740,7 +754,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
         # Slack's assistant_threads_setStatus disables the compose box, so the user can't type
         # /approve while "is thinking..." shows. Pausing stops _keep_typing re-setting it; resumed
         # in approve/deny.
-        adapter.pause_typing_for_chat(ctx._status_chat_id)
+        from gateway.platforms.typing_scope import set_typing_paused
+        set_typing_paused(adapter, ctx._status_chat_id, paused=True, metadata=ctx._status_thread_metadata)
         self._close_native_stream_boundary("Approval")
         # Redact credentials before display: the raw command string can carry secrets. Both the button and plain-text paths use this value.
         cmd = _redact_approval_command(approval_data.get("command", ""))

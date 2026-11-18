@@ -141,7 +141,8 @@ def _serve_plugin_skill(
         return _fail(f"Skill '{qualified_name}' is not supported on this platform.",
                      readiness_status=SkillReadinessStatus.UNSUPPORTED.value)
     if file_path:
-        return _serve_skill_file(skill_md.parent, file_path, qualified_name, read_error_prefix=True)
+        return _serve_skill_file(skill_md.parent, file_path, qualified_name, read_error_prefix=True,
+                                 mark_read=True)
     if any(p in content.lower() for p in _INJECTION_PATTERNS):
         logger.warning(
             "Plugin skill '%s:%s' contains patterns that may indicate prompt injection", namespace, bare)
@@ -154,6 +155,7 @@ def _serve_plugin_skill(
     rendered_content = content if not preprocess else _preprocess_skill(
         content, skill_md.parent, session_id, "Could not preprocess plugin skill %s:%s",
         namespace, bare)
+    _mark_background_review_read(skill_md)
     return _json({
         "success": True, "name": qualified_name, "content": banner + rendered_content,
         "description": _truncate_description(str(parsed_frontmatter.get("description", ""))),

@@ -77,7 +77,10 @@ def test_file_tools_refuse_a_locked_skill_and_its_record(locked_home):
 def test_terminal_refuses_writes_into_a_locked_skill_but_not_reads(locked_home, command, blocked):
     from tools.skill_lock import command_refusal
     lock_dir = locked_home / "skills/ops/locked-skill"
-    reason = command_refusal(command.format(L=lock_dir, H=locked_home), str(locked_home))
+    # terminal uses POSIX shell syntax: native Windows backslashes are escapes,
+    # not the intended path. Use shell-safe forward-slash spelling, not a weaker guard.
+    reason = command_refusal(command.format(L=lock_dir.as_posix(), H=locked_home.as_posix()),
+                             str(locked_home))
     assert (reason is not None) is blocked, reason
 
 
@@ -89,3 +92,32 @@ def test_lock_resolves_by_display_name_as_well_as_directory(locked_home):
     assert is_locked_skill("huggingface-accelerate")
     assert is_locked_skill("training/accelerate")
     assert not is_locked_skill("free-skill")
+
+
+@pytest.mark.platforms("windows")
+@pytest.mark.parametrize("spelling", ["forward", "native", "upper", "mixed", "relative"])
+@pytest.mark.parametrize("operation", ["write_locked", "read_locked", "write_free"])
+def test_inline_windows_path_spellings_keep_lock_and_read_boundaries(
+    locked_home, spelling, operation
+):
+    """Inspect code only; never execute a proposed locked write or fake the host OS."""
+    from tools.skill_lock import _code_refusal, locked_skill_dirs, _record_path
+
+    name = "free-skill" if operation == "write_free" else "locked-skill"
+    path = locked_home / "skills" / "ops" / name / "SKILL.md"
+    value = path.as_posix()
+    if spelling == "native":
+        value = str(path)
+    elif spelling == "upper":
+        value = value.upper()
+    elif spelling == "mixed":
+        value = value.replace("/skills/ops/", "\\skills/ops\\")
+    elif spelling == "relative":
+        value = f"skills\\ops/{name}\\SKILL.md"
+    # repr also covers escaped Windows separators in a real Python literal.
+    mode = "r" if operation == "read_locked" else "w"
+    code = f"open({value!r}, {mode!r}).{'read()' if mode == 'r' else 'write(chr(120))'}"
+    original = path.read_bytes()
+    reason = _code_refusal(code, locked_skill_dirs(), _record_path(), str(locked_home))
+    assert (reason is not None) is (operation == "write_locked"), reason
+    assert path.read_bytes() == original

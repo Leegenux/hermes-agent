@@ -241,6 +241,11 @@ def _skill_manage_batch(operations, default_name: str | None = None, task_id: st
     names, err = _validate_batch_ops(operations, default_name, tool_error)
     if err is not None:
         return err
+    from agent.background_review_capacity_skill_drafts import stage_skill_capacity
+    capacity = stage_skill_capacity({'action': 'batch',
+        'operations': [{**op, 'name': names[i]} for i, op in enumerate(operations)]})
+    if capacity is not None:
+        return capacity
     if not _smt._skill_gate_bypass.get():
         # Approval gate for the WHOLE batch as one pending write.
         def _staging(wa):

@@ -125,6 +125,15 @@ def test_prompt_carries_request_identity(pending_entry):
     assert adapter.card_metadata == [{"thread_id": "t1"}]
 
 
+def test_timeout_resumes_typing_for_the_prompt_topic(pending_entry):
+    adapter = _ButtonAdapter()
+    resumed = []
+    adapter.resume_typing_for_chat = lambda chat_id, metadata=None: resumed.append((chat_id, metadata))
+    _runner(adapter)._approval_notify_sync(dict(pending_entry.data))
+    pending_entry.settle('timeout')
+    assert resumed == [('C1', {'thread_id': 't1'})]
+
+
 @pytest.mark.parametrize("text_fallback", [False, True])
 def test_timeout_falls_back_to_a_new_message_when_the_card_cannot_be_edited(pending_entry, text_fallback):
     adapter = _PlainAdapter() if text_fallback else _ButtonAdapter(editable=False)

@@ -73,6 +73,7 @@ def _fire_post_api_request_hook(
     try:
         from hermes_cli.lifecycle import has_hook, invoke_hook as _invoke_hook
         if has_hook("post_api_request"):
+            from agent.usage_observer import response_fields
             _invoke_hook(
                 "post_api_request",
                 task_id=effective_task_id,
@@ -98,6 +99,7 @@ def _fire_post_api_request_hook(
                     response, assistant_message, finish_reason=finish_reason
                 ),
                 usage=agent._usage_summary_for_api_request_hook(response),
+                **response_fields(response),
                 context_length=getattr(getattr(agent, "context_compressor", None), "context_length", None),
                 assistant_message=assistant_message,
                 assistant_content_chars=len(assistant_message.content or ""),

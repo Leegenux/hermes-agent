@@ -62,6 +62,21 @@ def describe_active_work_unit(unit: dict, home: Optional[Path] = None) -> str:
         session = str(unit.get("session") or "?")
         model = unit.get("model")
         tool = unit.get("current_tool")
+        title, chat_name = unit.get("title"), unit.get("chat_name")
+        if title or chat_name or unit.get("activity"):
+            # Readable form: what the conversation is about, where it lives, what it is doing now.
+            where = " ".join(str(p) for p in (unit.get("platform"), unit.get("chat_type")) if p)
+            where += f" \"{chat_name}\"" if chat_name else ""
+            where += f" › topic {unit['thread_id']}" if unit.get("thread_id") else ""
+            head = f"\"{title}\"" if title else f"chat turn {session}"
+            now = f"tool {tool}" if tool else (str(unit["activity"]) if unit.get("activity") else "")
+            calls = unit.get("api_calls")
+            tail = "; ".join(p for p in (
+                f"running {_fmt_elapsed(unit['elapsed_s'])}" if unit.get("elapsed_s") is not None else "",
+                f"now: {now}" if now else "",
+                f"{calls} model calls so far" if calls else "",
+                f"model {model}" if model else "") if p)
+            return f"{head} — {where.strip() or session}" + (f" ({tail})" if tail else "")
         detail = ", ".join(p for p in (f"model {model}" if model else "", f"tool {tool}" if tool else "") if p)
         return f"chat turn {session}{pid_part}{elapsed_part}" + (f" [{detail}]" if detail else "")
     if kind == "delegation":

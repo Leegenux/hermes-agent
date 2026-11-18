@@ -11,13 +11,10 @@ import pytest
 
 @pytest.fixture
 def external_home(tmp_path, monkeypatch):
-    """HERMES_HOME with one external dir configured and one external skill in it.
+    """A real configured external directory; plain provenance/router cases need no symlink.
 
-    The external skill is ALSO reachable from the profile skills tree via a symlinked
-    SKILL.md — the common mounting style — because that is the shape the journey graph
-    actually sees (its roots are the bundled and profile skills dirs; rglob there does not
-    traverse dir symlinks but does yield symlinked files, and is_external_skill_path
-    resolves the link to tag it 'external').
+    Journey graph cases separately request external_linked_home. An unavailable file
+    symlink privilege must not prevent unrelated external-directory cases from running.
     """
     home = tmp_path / ".hermes"
     (home / "skills").mkdir(parents=True)
@@ -25,8 +22,6 @@ def external_home(tmp_path, monkeypatch):
     (ext_dir / "ext-skill").mkdir(parents=True)
     (ext_dir / "ext-skill" / "SKILL.md").write_text(
         "---\nname: ext-skill\ndescription: An external skill.\n---\n\n# External\n", encoding="utf-8")
-    (home / "skills" / "ext-linked").mkdir()
-    (home / "skills" / "ext-linked" / "SKILL.md").symlink_to(ext_dir / "ext-skill" / "SKILL.md")
     (home / "config.yaml").write_text(f"skills:\n  external_dirs:\n    - {ext_dir}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(home))
 
@@ -34,6 +29,19 @@ def external_home(tmp_path, monkeypatch):
     skill_utils._external_dirs_cache_clear()
     yield home
     skill_utils._external_dirs_cache_clear()
+
+
+@pytest.fixture
+def external_linked_home(external_home):
+    """Real mounted-file shape seen by the journey graph; no mock or silent skip.
+
+    rglob yields a symlinked SKILL.md but does not walk symlinked directories.
+    Keep the real filesystem proof (and any missing privilege error) on these cases.
+    """
+    mount = external_home / "skills" / "ext-linked"
+    mount.mkdir()
+    (mount / "SKILL.md").symlink_to(external_home.parent / "vault/ext-skill/SKILL.md")
+    return external_home
 
 
 def _write_local_skill(home, name: str):
@@ -69,7 +77,7 @@ class TestProvenanceTier:
 
 
 class TestLearningGraphExcludesExternal:
-    def test_used_external_skill_produces_no_learning_node(self, external_home):
+    def test_used_external_skill_produces_no_learning_node(self, external_linked_home):
         """Even a USED external skill is not a learning milestone (#108032)."""
         from agent import learning_graph
         with _patched_usage({"ext-skill": {"use_count": 5, "created_by": None}}):
@@ -77,15 +85,15 @@ class TestLearningGraphExcludesExternal:
                          if n["kind"] == "skill"}
         assert "ext-skill" not in skill_ids
 
-    def test_used_local_skill_still_produces_learning_node(self, external_home):
-        _write_local_skill(external_home, "my-local")
+    def test_used_local_skill_still_produces_learning_node(self, external_linked_home):
+        _write_local_skill(external_linked_home, "my-local")
         from agent import learning_graph
         with _patched_usage({"my-local": {"use_count": 3, "created_by": None}}):
             skill_ids = {n["id"] for n in learning_graph.build_learning_graph()["nodes"]
                          if n["kind"] == "skill"}
         assert "my-local" in skill_ids
 
-    def test_external_source_does_not_leak_to_later_skills_in_a_root(self, external_home, monkeypatch):
+    def test_external_source_does_not_leak_to_later_skills_in_a_root(self, external_linked_home, monkeypatch):
         """Order-forced twin of the above: when the external mount scans BEFORE the local
         skill in one rglob root, the local skill must still classify 'agent' — the loop
         must not carry 'external' forward on the ``source`` variable. The original leak only
@@ -94,7 +102,7 @@ class TestLearningGraphExcludesExternal:
         than the scan-order bug it was."""
         from pathlib import Path
         from agent import learning_graph
-        _write_local_skill(external_home, "my-local")
+        _write_local_skill(external_linked_home, "my-local")
         real_rglob = Path.rglob
 
         def hostile_rglob(self, pattern):

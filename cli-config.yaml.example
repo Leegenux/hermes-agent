@@ -1228,6 +1228,9 @@ skills:
 # Agent Behavior
 # =============================================================================
 agent:
+  # Official Codex Responses uses plain JSON by default. Set true to opt in
+  # to zstd when the Python stdlib codec is available.
+  codex_request_compression: false
   # Maximum tool-calling iterations per conversation (default: 500)
   # Higher = more room for complex tasks, but costs more tokens
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration

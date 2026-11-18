@@ -38,12 +38,18 @@ QUEUE_FULL_REPLY = ('⏳ Too many messages are already waiting in this conversat
 
 async def admit_message(authority, event):
     from gateway.session_authority import messaging_admission
+    owner = getattr(event, '_native_startup_owner', None)
+    if owner is not None:
+        owner.admission_started = True
     accepted, committed = busy_acceptance.get(), busy_commit.get()
     busy_acceptance.set(None)  # the drain task this schedules must not inherit the busy caller's future
     busy_commit.set(None)
     ingress = messaging_admission.set(True if accepted is None else accepted)
     try:
-        receipt = await authority.admit_native(event)
+        if owner is None:
+            receipt = await authority.admit_native(event)
+        else:
+            receipt = await authority.admit_native(event, _startup_owner=owner)
         if committed is not None and not committed.done():
             committed.set_result(None)  # the row is durable (any status): a barrier may go on
     except RuntimeStoreError as exc:
@@ -63,6 +69,8 @@ async def admit_message(authority, event):
     finally:
         messaging_admission.reset(ingress)
     if receipt.status == 'terminal':
+        if owner is not None:
+            owner.finish()
         return None
     # Only the delivery waiter is process-local; execution reads the committed snapshot.
     authority.native_waiters.add(receipt.admission_id)
@@ -84,9 +92,13 @@ async def admit_message(authority, event):
             del authority.waiters[receipt.admission_id]
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
+        if owner is not None:
+            owner.finish()
         return None if status == 'terminal' else pause_notice(authority, receipt.ref, 'unknown_execution')
     if accepted is not None and not accepted.done():
         accepted.set_result(None)
+    if owner is not None:
+        owner.finish()
     try:
         return await asyncio.shield(waiter)
     except RuntimeStoreError as exc:
@@ -350,6 +362,16 @@ async def execute_admission(authority, ref, row):
                 event.allow_gateway_control = False
                 event.internal = True  # trust comes from the private binding and preclaim, never client JSON
             response = await authority.runner._handle_message(event)
+            from gateway.completion_report_scope import prepare_response
+            response = await prepare_response(authority, row, response, captured)
+            receipt = captured.get('result', {}).get('completion_report_receipt')
+            if receipt is not None and receipt.get('reports'):
+                from gateway.completion_report_scope import completion_scope
+                scope = completion_scope.get()
+                event._completion_report_delivery = {
+                    'authority': authority, 'admission_id': row['admission_id'],
+                    'report_ids': [report['report_id'] for report in scope['reports']
+                                   if any(part['identity'] == report['identity'] for part in receipt['reports'])]}
             result = captured.get('terminal_result', captured.get('result'))
             if result is None:
                 # No TurnRunner result means the handler answered without executing the turn.
@@ -416,7 +438,9 @@ async def _admission_scope(authority, home, row, event, captured):
     turn (``session_producer_lifecycle``; a no-op for every other admission)."""
     async with producer_turn(authority, row, event, captured):
         with await _execution_scope(authority, home):
-            yield
+            from gateway.completion_report_scope import report_turn
+            async with report_turn(authority, row, event):
+                yield
 
 
 async def _execution_scope(authority, home):
@@ -487,8 +511,15 @@ async def deliver_response(adapter, event, session_key, response):
     text, ttl = adapter._unwrap_ephemeral(response)
     if not text:
         return True
-    extracted = await adapter._extract_response_content(text, event, session_key, is_ephemeral_response=ttl > 0)
     metadata = _mark_notify_metadata(_thread_metadata_for_event(event))
+    if getattr(event, '_completion_report_delivery', None) is not None:
+        # The protocol is text-only: preserve the exact bound response and do not
+        # reinterpret its prose as image/file directives or partial attachments.
+        from gateway.platforms.base import _reply_anchor_for_event
+        result, _delivery_adapter = await adapter.send_final_ledgered(
+            event, session_key, text, metadata, reply_to=_reply_anchor_for_event(event))
+        return bool(result.success)
+    extracted = await adapter._extract_response_content(text, event, session_key, is_ephemeral_response=ttl > 0)
     results = []
     if extracted.text_content:
         await adapter._send_final_text(event, session_key, extracted.text_content,
@@ -509,6 +540,8 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
     next command waits for that too (``burst_gate``): a non-burst busy input (a second video, a voice
     note, text outside queue mode) has no burst commit task to wait on."""
     delivery_event = replace(event, source=replace(event.source))
+    from gateway.session_startup_owner import attach
+    owner = attach(getattr(adapter, 'gateway_runner', None), event, session_key)
     accepted = asyncio.get_running_loop().create_future()
     committed = asyncio.get_running_loop().create_future()
 
@@ -534,10 +567,16 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
             await adapter._release_turn_marker(delivery_event)
             await adapter._release_turn_marker(event)
 
+    from gateway.session_authority import _ArrivalEpoch, _arrival_epoch
+    arrival = _ArrivalEpoch(owner.authority, owner.route, owner.epoch) if owner is not None else None
+    arrival_token = _arrival_epoch.set(arrival)
     token, commit_token = busy_acceptance.set(accepted), busy_commit.set(committed)
     try:
         task = asyncio.create_task(observe())
+        if owner is not None:
+            task.add_done_callback(lambda _task: owner.finish())
     finally:
+        _arrival_epoch.reset(arrival_token)
         busy_acceptance.reset(token)
         busy_commit.reset(commit_token)
     adapter._background_tasks.add(task)

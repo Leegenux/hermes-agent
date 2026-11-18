@@ -126,6 +126,7 @@ def perform_api_call(
         )
 
     from hermes_cli.middleware import run_llm_execution_middleware
+    from agent.usage_observer import request_scope
 
     # The ``_model_request_active`` bracket is taken under the redirect lock when one exists,
     # so redirect() can't observe a half-toggled flag.
@@ -136,13 +137,16 @@ def perform_api_call(
         if _model_request_active is not None:
             _model_request_active.set()
     try:
-        response = run_llm_execution_middleware(
-            api_kwargs, _perform_api_call, original_request=_original_api_kwargs,
-            task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
-            session_id=agent.session_id or "", platform=agent.platform or "", model=agent.model,
-            provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
-            api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
-        )
+        with request_scope(dict(task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
+                               session_id=agent.session_id or "", platform=agent.platform or "",
+                               model=agent.model, provider=agent.provider, api_mode=agent.api_mode)):
+            response = run_llm_execution_middleware(
+                api_kwargs, _perform_api_call, original_request=_original_api_kwargs,
+                task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
+                session_id=agent.session_id or "", platform=agent.platform or "", model=agent.model,
+                provider=agent.provider, base_url=agent.base_url, api_mode=agent.api_mode,
+                api_call_count=api_call_count, middleware_trace=list(_llm_middleware_trace),
+            )
     finally:
         with _bracket:
             if _model_request_active is not None:
@@ -177,6 +181,8 @@ class ApiInterruptVerdict:
 def handle_api_interrupt(
     agent: Any, *, _retry: Any, thinking_spinner: Any, messages: Any, conversation_history: Any,
     api_start_time: Any, interrupted: Any, final_response: Any,
+    effective_task_id: Any = None, turn_id: Any = None, api_request_id: Any = None,
+    api_call_count: Any = None, api_kwargs: Any = None, retry_count: Any = None,
 ) -> ApiInterruptVerdict:
     """``InterruptedError`` during the provider call: a pending redirect keeps its correction
     queued for the outer-loop rebuild; otherwise keep any streamed partial text so the next
@@ -184,6 +190,14 @@ def handle_api_interrupt(
     from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 
     thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
+    # A redirect restarts with the same logical request ID; close the cancelled attempt first.
+    if api_request_id:
+        agent._invoke_api_request_error_hook(
+            task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
+            api_call_count=api_call_count, api_start_time=api_start_time, api_kwargs=api_kwargs,
+            error_type="InterruptedError", error_message="Model request interrupted",
+            retry_count=retry_count, retryable=False, reason="interrupted",
+        )
     # redirect() cancelled only this request: keep the correction queued, clear the
     # cancellation bit, let the outer loop rebuild. Never materialize incomplete
     # signed/encrypted reasoning items.

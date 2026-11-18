@@ -109,6 +109,17 @@ def _resolve_child_toolsets(
         child_toolsets = sorted(parent_toolsets) or DEFAULT_TOOLSETS
     child_toolsets = _strip_blocked_tools(child_toolsets)
 
+    # Same-tree messaging is a collaboration primitive, not delegation authority:
+    # a child inherits it only when the parent already carries the tool. Spawn
+    # remains blocked/normal per depth; the toolset itself cannot spawn.
+    parent_tool_names = getattr(parent_agent, "valid_tool_names", None)
+    if (
+        "agent_messaging" not in child_toolsets
+        and isinstance(parent_tool_names, (set, list, tuple))
+        and "agent_message" in parent_tool_names
+    ):
+        child_toolsets.append("agent_messaging")
+
     raw_parent_disabled = getattr(parent_agent, "disabled_toolsets", None)
     inherited_disabled = (
         [str(name) for name in raw_parent_disabled] if isinstance(raw_parent_disabled, (list, tuple, set)) else []

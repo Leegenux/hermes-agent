@@ -61,6 +61,8 @@ DEFAULT_CONFIG = {
         "storage": "hermes-home",
     },
     "agent": {
+        # Optional zstd request compression for the official Codex Responses API.
+        "codex_request_compression": False,
         # Turn cap. null = unlimited (default; caps caused silent mid-task truncation). Positive int
         # caps; "none"/"unlimited"/"inf"/0/-1 also mean unlimited (resolve_turn_limit).
         "max_turns": None,
@@ -792,7 +794,7 @@ DEFAULT_CONFIG = {
         # conversation's reasoning config verbatim so its request bytes keep the parent's warm
         # prompt-cache prefix (#30532). Set provider/model below to route the review to another model
         # if you want a different effort level; a one-time warning says so when the key is set.
-        "background_review": {"enabled": True, **_aux(120)},
+        "background_review": {"enabled": True, "capacity_consolidation": False, **_aux(120)},
         # No reasoning_effort on MoA blocks by design — configured PER SLOT in the preset
         # (moa.presets.<name>.reference_models[].reasoning_effort / aggregator.reasoning_effort).
         "moa_reference": _aux(900, reasoning_effort=False),
@@ -1338,8 +1340,7 @@ DEFAULT_CONFIG = {
         # and every compaction is a chance to lose detail, so the default stays off. A token count >= 16000 enables it;
         # other values (true, "200k") are config errors: warned and ignored.
         "compression_threshold_tokens": 0,
-        # When delegate_task narrows child toolsets, keep the parent's enabled MCP toolsets (so
-        # toolsets=["web"] doesn't strip MCP). false = strict intersection.
+        # Narrowed child toolsets keep the parent's MCP toolsets (toolsets=["web"] keeps MCP); false = strict
         "inherit_mcp_toolsets": True,
         # Per-subagent iteration cap (own budget, independent of the parent's).
         "max_iterations": 250,
@@ -1376,6 +1377,7 @@ DEFAULT_CONFIG = {
         # notifications to the PARENT; false suppresses them (the child's result is the
         # deliverable). Async-delegation results are NEVER suppressed.
         "surface_child_process_notifications": False,
+        "resumable_ttl_hours": 48, "max_resumable": 32, "auto_resume": False,  # stopped-child records; auto: opt-in
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
     # every API call for few-shot priming. Never saved to sessions/logs/trajectories.

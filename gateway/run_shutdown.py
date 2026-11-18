@@ -17,7 +17,6 @@ import sys
 import threading
 import time
 from contextlib import contextmanager, nullcontext, suppress
-from contextvars import Context
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
@@ -28,6 +27,7 @@ from gateway.restart import (
     effective_stop_drain_timeout, effective_stop_watchdog_delay, resolve_cron_drain_budget
 )
 from gateway.run_common import _UNSET
+from gateway.run_restart_control import GatewayRestartControlMixin
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
 from gateway.session_runtime_workers import uncounted_runtime_work_units
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
@@ -171,7 +171,7 @@ def _effective_watchdog_leash(runner: object) -> float:
     return effective_stop_watchdog_delay(runner, resolve_shutdown_watchdog_delay(effective_stop_drain_timeout(runner)))
 
 
-class GatewayShutdownMixin(GatewaySessionEndMixin):
+class GatewayShutdownMixin(GatewayRestartControlMixin, GatewaySessionEndMixin):
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
     @dataclasses.dataclass
@@ -837,6 +837,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         cron_deadline = started + (timeout if cron_timeout is None else cron_timeout)
 
         def _still_draining() -> bool:
+            if getattr(self, "_restart_force", False):
+                return False
             now = loop.time()
             agents, cron, api, deferred = self._drain_work_counts()
             return bool(((agents or deferred) and now < deadline) or ((cron or api) and now < cron_deadline))
@@ -1640,6 +1642,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         deadline = loop.time() + timeout
         last_status_at = 0.0
         while self._awaitable_work_count() > 0:
+            if getattr(self, "_restart_force", False):
+                return False
             now = loop.time()
             if now >= deadline:
                 logger.warning(
@@ -1669,40 +1673,6 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             )
             return False
         logger.info("Restart deferred wait complete — active work drained; proceeding to stop()")
-        return True
-
-    def request_restart(self, *, detached: bool = False, via_service: bool = False) -> bool:
-        if self._restart_task_started:
-            return False
-        self._restart_requested = True
-        self._restart_detached = detached
-        self._restart_via_service = via_service
-        self._restart_task_started = True
-        # Refuse new turns; keep ``_running`` True so the active turn can still deliver its final response.
-        self._draining = True
-        from gateway.drain_control import open_restart_wait
-        open_restart_wait(self)  # clients may still answer a turn parked on approval/clarify (#139041)
-        # The restart's after-turn wait is a drain window too: pollers of GET /v1/runs/{id} must see
-        # the boundary from the moment new turns are refused, not only once stop() begins (#115133).
-        self._mark_api_runs_shutdown_requested()
-
-        async def _run_restart() -> None:
-            await self._await_active_work_before_restart()
-            # Detached helper only AFTER the after-turn wait, or its drain_timeout+5 deadline fires mid-turn.
-            if detached:
-                with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart helper: %s"):
-                    await self._launch_detached_restart_command()
-            await asyncio.sleep(0.05)
-            await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
-
-        # NOT in _background_tasks: _stop_impl cancels those, which would cancel _run_restart while it
-        # awaits _stop_task and skip _shutdown_event.set() / _exit_code = 75 (#12875). We still hold a strong reference in
-        # self._restart_task: a bare asyncio.create_task() keeps only a weak reference, so the event loop
-        # may garbage-collect a still-pending task mid-flight. The cancel loop in _stop_impl explicitly
-        # skips _restart_task for the same reason it skips _stop_task.
-        # Empty Context: /restart is handled inside the requester's profile scope, and a copied context
-        # would run the HOST restart as that profile (watcher HERMES_HOME, stop()'s flushes).
-        self._restart_task = Context().run(lambda: asyncio.create_task(_run_restart()))
         return True
 
     def _start_systemd_watchdog(self) -> bool:
@@ -1783,7 +1753,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             from tools.async_delegation import interrupt_all as _interrupt_async
             _count_step(
                 "Shutdown (%s): interrupted %d background delegation(s)",
-                lambda: _interrupt_async(reason=f"gateway shutdown ({phase})"),
+                lambda: _interrupt_async(reason=f"gateway shutdown ({phase})", resumable=True),
             )
 
         _step("process_registry.kill_all", _kill_processes)
@@ -1871,6 +1841,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         _cron_timeout = resolve_cron_drain_budget(
             timeout, _cron_drain_cfg, watchdog_delay=_cron_leash, elapsed=ctx.elapsed(),
         )
+        if getattr(self, "_restart_force", False):
+            _cron_timeout = 0.0
         if (_cron_at_start or _api_at_start) and _cron_timeout > timeout:
             logger.info(
                 "Shutdown drain: %d in-flight cron job(s), %d api_server run(s) — waiting up to "
@@ -2203,7 +2175,7 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
         try:
             await GatewayRunner._stop_begin_teardown(self, ctx)
             timeout = effective_stop_drain_timeout(self)
-            if timeout < self._restart_drain_timeout:
+            if timeout < self._restart_drain_timeout and not getattr(self, "_restart_force", False):
                 logger.warning(
                     "Shutdown drain capped to %.0fs (configured %.0fs) to fit the live launchd exit "
                     "timeout of %.0fs — launchd SIGKILLs past it",
@@ -2213,7 +2185,8 @@ class GatewayShutdownMixin(GatewaySessionEndMixin):
             if ctx.timed_out:
                 await GatewayRunner._stop_interrupt_remaining_work(self, ctx)
             from gateway.run_runtime import settle_gateway_runtime  # within what the leash has left
-            await settle_gateway_runtime(self, _effective_watchdog_leash(self) - ctx.elapsed(), GatewayRunner._shutdown_interrupt_reason(self))
+            settle_budget = 0.0 if getattr(self, "_restart_force", False) else _effective_watchdog_leash(self) - ctx.elapsed()
+            await settle_gateway_runtime(self, settle_budget, GatewayRunner._shutdown_interrupt_reason(self))
             await GatewayRunner._stop_finalize_agents_and_adapters(self, ctx)
             await GatewayRunner._stop_release_runtime_state(self, ctx)
             GatewayRunner._stop_quiesce_and_close_session_dbs(self, timeout, ctx)

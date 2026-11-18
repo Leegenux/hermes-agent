@@ -902,7 +902,7 @@ def decline_extras(names: list[str]) -> None:
 
 
 def _sync_locked(extras, *, package, plugins, repair: bool, explicit: bool, shipped, frozen,
-                 evict_incompatible_plugins: bool) -> None:
+                 evict_incompatible_plugins: bool, rebuild_source: bool) -> None:
     """sync_venv's body under the held dependency lock."""
     from pm import receipt
     from pm.publication import StagedPlugin
@@ -922,7 +922,7 @@ def _sync_locked(extras, *, package, plugins, repair: bool, explicit: bool, ship
         fact = facts.get("venv") or _facts().get("venv") or {}
         enabled, stamp, inputs = _target_selection(package, fact, extras=extras, inputs=inputs,
                                                    repair=repair, shipped=shipped, frozen=frozen)
-        current = not repair and _runtime_state_matches(fact, stamp)
+        current = not repair and not rebuild_source and _runtime_state_matches(fact, stamp)
         if not current and not repair and not explicit and not lazy_installs_allowed():
             raise _refuse_lazy("venv", str(extras) if extras else "venv out of sync")
         receipt.record_feature_list(enabled)
@@ -933,11 +933,14 @@ def _sync_locked(extras, *, package, plugins, repair: bool, explicit: bool, ship
 def sync_venv(extras: Optional[list[str]] = None, *, explicit: bool = False,
               plugins: PluginInput | None = None, repair: bool = False,
               evict_incompatible_plugins: bool = False, automatic: Optional[list[str]] = None,
-              carried: Optional[list[str]] = None) -> None:
+              carried: Optional[list[str]] = None, rebuild_source: bool = False) -> None:
     """Make the venv match uv.lock + the enabled extras. Extras union into
     the installed state (one ledger); no-op when the stamp already matches.
     ``repair`` restores the recorded dependency graph into a fresh generation,
     bypassing both that shortcut and config discovery. It cannot add features.
+    ``rebuild_source`` deliberately rebuilds from current source even when the
+    dependency stamp matches; it requires explicit=True and is incompatible with
+    repair, plugin eviction and staged plugin updates.
     ``explicit`` marks a deliberate install command (`hermes pm install`,
     `hermes update`) — those are the remedy the lazy-install policy points
     at, so the policy does not apply to them. ``plugins`` names the one
@@ -968,6 +971,8 @@ def sync_venv(extras: Optional[list[str]] = None, *, explicit: bool = False,
     token = receipt.begin("sync")
     outcome = "failed"
     try:
+        if rebuild_source and (not explicit or repair or evict_incompatible_plugins or isinstance(plugins, StagedUpdate)):
+            raise ValueError("source rebuild requires an explicit sync, without repair, eviction or staged update")
         if repair and (extras is not None or plugins is not None):
             raise ValueError("repair restores the recorded environment; it cannot change features or plugins")
         if evict_incompatible_plugins and (repair or plugins is not None or not explicit):
@@ -979,7 +984,8 @@ def sync_venv(extras: Optional[list[str]] = None, *, explicit: bool = False,
         from hermes_cli.runtime_state import recover_publication
         from functools import partial
         sync = partial(_sync_locked, package=package, plugins=plugins, repair=repair, explicit=explicit,
-                       shipped=shipped, frozen=frozen, evict_incompatible_plugins=evict_incompatible_plugins)
+                       shipped=shipped, frozen=frozen, evict_incompatible_plugins=evict_incompatible_plugins,
+                       rebuild_source=rebuild_source)
         automatic = [*(automatic or ()), *(carried or ())]  # a carried extra is automatic too
         with _venv_install_lock(patient=explicit or repair):
             if not repair:

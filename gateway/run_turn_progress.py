@@ -235,6 +235,9 @@ class GatewayTurnProgressMixin:
         # "new" mode: only report when tool changes
         if ctx.progress_mode == "new" and tool_name == ctx.last_tool[0]:
             return
+        from gateway.goal_progress import goal_arguments
+        if ctx.source.platform == Platform.TELEGRAM and goal_arguments(tool_name, args) is not None:
+            return  # ID-bearing callbacks own the one editable Goal receipt.
         ctx.last_tool[0] = tool_name
         msg = self._progress_build_message(tool_name, preview, args)
         if msg is not None:
@@ -294,16 +297,21 @@ class GatewayTurnProgressMixin:
 
     @staticmethod
     def _preview_cap() -> int:
-        """tool_preview_length (default 40): the one-line preview budget for "all"/"new" modes."""
+        """Budget for the "all"/"new" previews: the configured value, or 40 when unset.
+
+        ``0`` is the documented "no limit", so it must survive as 0 rather than collapsing back
+        to the compact default (#51067); only "never configured" falls back to 40.
+        """
         from agent.display import get_tool_preview_max_len
         pl = get_tool_preview_max_len()
-        return pl if pl > 0 else 40
+        return 40 if pl is None else pl
 
     def _progress_terminal_blocks(self, adapter, tool_name, args, emoji):
         """(full, short) fenced blocks for a terminal command on markdown platforms, else (None, None).
 
         No language tag: Slack mrkdwn renders it as a literal first code line. Verbose shows the FULL
-        command; "all"/"new" truncate to one line capped at ``tool_preview_length``. Consecutive
+        command; "all"/"new" show the whole command when it fits ``tool_preview_length`` (0 = no
+        limit) and otherwise truncate to one line capped at that budget. Consecutive
         terminal calls drop the repeated header so back-to-back commands render as adjacent blocks.
         """
         if not (
@@ -316,8 +324,10 @@ class GatewayTurnProgressMixin:
         cap = self._preview_cap()
         lines = cmd_full.splitlines()
         cmd_short = lines[0] if lines else cmd_full
-        if len(cmd_short) > cap:
-            cmd_short = cmd_short[:cap - 3] + "..."
+        if cap <= 0 or len(cmd_full) <= cap:
+            cmd_short = cmd_full  # fits the budget (or no budget): eliding a visible command is noise
+        elif len(cmd_short) > cap:
+            cmd_short = "." * cap if cap <= 3 else cmd_short[:cap - 3] + "..."
         elif len(lines) > 1:
             cmd_short += " ..."
         return f"{header}```\n{cmd_full}\n```", f"{header}```\n{cmd_short}\n```"
@@ -338,9 +348,9 @@ class GatewayTurnProgressMixin:
         if verbose:
             if code is None and args:
                 from agent.display import get_tool_preview_max_len, verbose_tool_args_text
-                # tool_preview_length 0 (default) = no truncation in verbose mode; the user asked
-                # for full detail and platform message-length limits handle the rest.
-                args_str = verbose_tool_args_text(args, get_tool_preview_max_len(),
+                # Never configured or 0 = no truncation in verbose mode; the user asked for full
+                # detail and platform message-length limits handle the rest.
+                args_str = verbose_tool_args_text(args, get_tool_preview_max_len() or 0,
                                                   getattr(adapter, "supports_code_blocks", False))
                 code = t("gateway.progress.tool_verbose", emoji=emoji, tool=tool_name, keys=list(args.keys()), args=args_str)
             elif code is None:
@@ -737,9 +747,13 @@ class GatewayTurnProgressMixin:
 
     async def _drain_progress_on_cancel(self, st) -> None:
         ctx = self._ctx
+        goal_lane = getattr(self, '_goal_progress_lane', None)
         with suppress(Exception):
             while not ctx.progress_queue.empty():
                 raw = ctx.progress_queue.get_nowait()
+                if goal_lane is not None and goal_lane.accepts(raw):
+                    await goal_lane.apply(raw)
+                    continue
                 if self._is_reset_marker(raw):
                     # Content-bubble marker during drain: close the current progress bubble
                     # and start a fresh one for tool lines that arrived after.
@@ -753,6 +767,8 @@ class GatewayTurnProgressMixin:
         if st.can_edit and st.progress_lines and st.progress_msg_id:
             await self._roll_progress_overflow_if_needed(st)
         await self._flush_progress_edit(st)
+        if goal_lane is not None:
+            await goal_lane.flush(force=True)
 
     async def _progress_restore_typing(self, st) -> None:
         ctx = self._ctx
@@ -830,48 +846,59 @@ class GatewayTurnProgressMixin:
         if adapter_edit is None or adapter_edit is BasePlatformAdapter.edit_message:
             self._drain_progress_queue()
             return
+        from gateway.goal_progress import GoalProgressLane
+        goal_lane = self._goal_progress_lane = GoalProgressLane(self, adapter)
         st = self._progress_edit_state(adapter)
         last_edit_ts = 0.0
         EDIT_INTERVAL = 1.5  # Minimum seconds between edits (Telegram flood control)
-        while True:
-            try:
-                if not ctx._run_still_current():
-                    self._drain_progress_queue()
-                    return
-                raw = ctx.progress_queue.get_nowait()
-                # Drain silently when interrupted: events queued in the window between tool parse
-                # and interrupt processing should not render as bubbles.
-                if self._agent_interrupted():
-                    await asyncio.sleep(0)
-                    continue
-                if self._is_reset_marker(raw):
-                    self._reset_progress_bubble(st)
-                    continue
-                msg = self._progress_absorb(st, raw)
-                if not await self._roll_progress_overflow_if_needed(st):
-                    # Throttle edits: batch rapid tool updates into fewer API calls (grammY pattern:
-                    # proactively rate-limit rather than react to 429s). Loop back to drain further
-                    # queued messages before sending a single batched edit.
-                    remaining = EDIT_INTERVAL - (time.monotonic() - last_edit_ts)
-                    if remaining > 0:
-                        await asyncio.sleep(remaining)
-                        continue
+        try:
+            while True:
+                try:
                     if not ctx._run_still_current():
+                        self._drain_progress_queue()
                         return
-                    if not await self._progress_send_or_edit(st, msg):
+                    raw = ctx.progress_queue.get_nowait()
+                    # Drain silently when interrupted: events queued in the window between tool parse
+                    # and interrupt processing should not render as bubbles.
+                    if self._agent_interrupted():
+                        await asyncio.sleep(0)
                         continue
-                last_edit_ts = time.monotonic()
-                await self._progress_restore_typing(st)
-            except queue.Empty:
-                if time.monotonic() - last_edit_ts >= EDIT_INTERVAL and await self._deliver_flood_pending_progress(st):
+                    if goal_lane.accepts(raw):
+                        await goal_lane.apply(raw)
+                        continue
+                    if self._is_reset_marker(raw):
+                        self._reset_progress_bubble(st)
+                        continue
+                    msg = self._progress_absorb(st, raw)
+                    if not await self._roll_progress_overflow_if_needed(st):
+                        # Throttle edits: batch rapid tool updates into fewer API calls (grammY pattern:
+                        # proactively rate-limit rather than react to 429s). Loop back to drain further
+                        # queued messages before sending a single batched edit.
+                        remaining = EDIT_INTERVAL - (time.monotonic() - last_edit_ts)
+                        if remaining > 0:
+                            await asyncio.sleep(remaining)
+                            continue
+                        if not ctx._run_still_current():
+                            return
+                        if not await self._progress_send_or_edit(st, msg):
+                            continue
                     last_edit_ts = time.monotonic()
-                await asyncio.sleep(0.3)
-            except asyncio.CancelledError:
+                    await self._progress_restore_typing(st)
+                except queue.Empty:
+                    # Upstream idle tick still delivers a flood-window-held update; the goal lane
+                    # keeps its own fast flush so a cancel cannot drop a completed goal receipt.
+                    if time.monotonic() - last_edit_ts >= EDIT_INTERVAL and await self._deliver_flood_pending_progress(st):
+                        last_edit_ts = time.monotonic()
+                    await goal_lane.flush()
+                    await asyncio.sleep(0.3)
+                except asyncio.CancelledError:
+                    return
+                except Exception as e:
+                    logger.error("Progress message error: %s", e)
+                    await asyncio.sleep(1)
+        finally:
+            if ctx._run_still_current() and not self._agent_interrupted():
                 await self._drain_progress_on_cancel(st)
-                return
-            except Exception as e:
-                logger.error("Progress message error: %s", e)
-                await asyncio.sleep(1)
 
     # ── ID-bearing lifecycle callbacks (agent thread) ───────────────────────────────────────
 
@@ -933,6 +960,8 @@ class GatewayTurnProgressMixin:
             local_viewer_events.note_tool_start(self, call_id, tool_name, args)
         self._publish_execution("tool.start", _tool_lifecycle_payload(call_id, tool_name, args))
         self._publish_api_tool("tool.start", call_id, tool_name, args)
+        from gateway.goal_progress import queue_goal_receipt
+        queue_goal_receipt(self, call_id, tool_name, args)
         if self._ctx._voice_ack_guild[0] is not None:
             self.voice_ack_callback(call_id, tool_name, args)
         if self._ctx._native_slack_task_cards:
@@ -954,6 +983,8 @@ class GatewayTurnProgressMixin:
             # Task state is application data, not tool chrome: the full snapshot, as the TUI gateway emits it.
             self._publish_execution("todo.updated", {"todos": payload["todos"], "revision": payload.get("revision", 0)})
         self._publish_api_tool("tool.complete", call_id, tool_name, args, result)
+        from gateway.goal_progress import queue_goal_receipt
+        queue_goal_receipt(self, call_id, tool_name, args, result, completed=True)
         if local_viewer_turn(self):
             from gateway import local_viewer_events
             local_viewer_events.publish_control_if_changed(self)

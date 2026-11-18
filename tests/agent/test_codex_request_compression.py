@@ -18,7 +18,8 @@ def _send_through_hooks(client, url: str, payload: dict):
     return request
 
 
-def test_official_codex_responses_body_is_zstd_and_lossless():
+def test_official_codex_responses_body_is_zstd_and_lossless(monkeypatch):
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"agent": {"codex_request_compression": True}})
     payload = {"model": "gpt-6.1-sol", "input": [{"role": "user", "content": "hi " * 500}]}
     client = build_keepalive_http_client(OFFICIAL)
     try:

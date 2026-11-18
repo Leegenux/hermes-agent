@@ -679,6 +679,10 @@ class GatewayTurnPersistenceMixin:
     ):
         """Final delivery decisions: intentional silence, voice reply, streamed-turn media/footer.
         Returns the text for the adapter to send, or ``None`` when already delivered."""
+        from gateway.completion_report_scope import completion_scope
+        if completion_scope.get() is not None:
+            # The authority validates the full envelope before any text/media/TTS delivery.
+            return response
         if diagnostic_wake_muted(event):
             return None
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).

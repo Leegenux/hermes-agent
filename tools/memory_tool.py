@@ -192,28 +192,51 @@ def _background_delete_gate(store, action, operations, target="memory", content=
                if operations is not None else
                {"action": action, "target": target, "content": content, "old_text": old_text})
     if not destructive_ops(payload):
+        from agent.background_review_capacity_drafts import _SCOPE
+        scope = _SCOPE.get()
+        if scope is not None and any(t.kind == 'memory' and t.name == target
+                                     for t in scope.plan.targets):
+            from agent.background_review_capacity_drafts import record_capacity_rejection
+            record_capacity_rejection('memory', target)
+            return tool_error('An admitted capacity target requires a shrinking, backed proposal; '
+                              'add-only writes are not capacity consolidation.', success=False)
         return None
     detail = ("; ".join(_batch_op_line(op) for op in operations) if operations is not None
               else _batch_op_line({"action": action, "content": content, "old_text": old_text}))
     try:
         if (unmatched := _pin_matched_entries(store, payload)) is not None:
+            from agent.background_review_capacity_drafts import record_capacity_rejection
+            record_capacity_rejection('memory', target)
             return unmatched
         from tools import write_approval as wa
+        from agent.background_review_capacity_drafts import capacity_memory_metadata, finish_capacity_stage
+
+        metadata = capacity_memory_metadata(store, payload)
         FAILURE_CLASS.set("staged")
         record = wa.stage_write(
             wa.MEMORY, payload,
             summary=(f"background review consolidation ({'batch' if operations is not None else action} "
                      f"on {target}): {detail}")[:200],
-            origin=wa.current_origin())
+            origin=wa.current_origin(), **({"metadata": metadata} if metadata is not None else {}))
+        finish_capacity_stage(record, metadata)
+        # Capacity drafts have their own verified transaction outcome summary;
+        # only ordinary proposals should request manual /memory approval.
         return json.dumps({
-            "success": True, "staged": True, "proposal_staged": True, "pending_id": record["id"],
-            "message": ("Background review may not delete memory entries unattended. The proposed "
+            "success": True, "staged": True, "proposal_staged": metadata is None, "pending_id": record["id"],
+            "message": ("Capacity draft staged for independent preservation review; this tool did not install it."
+                        if metadata is not None else
+                        "Background review may not delete memory entries unattended. The proposed "
                         f"{'batch' if operations is not None else action} was staged for your approval — "
-                        "review it with /memory pending (approve to apply, discard to drop)."),
+                        f"{wa.pending_count(wa.MEMORY)} pending write(s) now await review at /memory pending "
+                        "(approve to apply, discard to drop)."),
         }, ensure_ascii=False)
     except Exception:
         logger.warning("Failed to stage background-review consolidation; denying", exc_info=True)
         FAILURE_CLASS.set("gate_refused")
+        from agent.background_review_capacity_drafts import record_capacity_rejection
+        if record_capacity_rejection('memory', target):
+            return tool_error('Capacity proposal backup, preview or persistence verification failed. '
+                              'No change applied. Do not use add as a fallback.', success=False)
         return tool_error(
             "Background review may not delete memory entries ('patch'/'remove', including in a "
             "batch); 'add' is still available.", success=False)
@@ -355,6 +378,10 @@ def apply_memory_pending(payload: dict[str, Any], store: MemoryStore) -> dict[st
     replace/remove applies to exactly its pinned ``matched_entry`` or is refused; a record
     staged before pinning has no verifiable target, so it is refused rather than replayed by
     old_text (which could hit a newer entry the approver never saw)."""
+    if "_native_capacity_draft" in payload:
+        return {"success": False, "error": "Capacity draft is not approved for replay. It requires independent "
+                                           "preservation review and the verified capacity transaction; "
+                                           "nothing was applied and its backup must be retained."}
     action, target = payload.get("action"), payload.get("target")
     target_error = _memory_target_error(store, target, payload.get("operations"))
     if target_error is not None:

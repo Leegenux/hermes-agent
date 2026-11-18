@@ -64,6 +64,7 @@ def runtime_command(repo_root: Path, args=(), *, module: str = "hermes_cli.main"
         "os.environ.pop('PYTHONHOME', None); os.environ.pop('PYTHONPATH', None); "
         "os.environ.pop('VIRTUAL_ENV', None); "
         f"sys.path.insert(0, {_inline_string_literal(str(root))}); "
+        f"exec({_inline_string_literal(_local_patch_launch_guard(root))}); "
         + pin
         + "import hermes_bootstrap; "
         + settle
@@ -442,6 +443,20 @@ def _hermes_closure_repair():
 """
 
 
+def _local_patch_launch_guard(root: Path) -> str:
+    """The persisted launcher must refuse pending unpatched source before any checkout import."""
+    root = Path(root).resolve()
+    pending = root.parent / 'patches/replay-kit/native-update-pending.json'
+    guard = root.parent / 'bin/native_patch_guard.py'
+    return (
+        'import pathlib, subprocess\n'
+        f'if pathlib.Path({str(pending)!r}).exists():\n'
+        f'    _patch_result = subprocess.run([sys.executable, "-I", "-S", "-B", {str(guard)!r}, '
+        f'"launch", "--root", {str(root)!r}], timeout=300, check=False)\n'
+        '    if _patch_result.returncode: sys.exit(_patch_result.returncode)\n'
+    )
+
+
 def _launcher_script(name: str, repo_root: Path, dependencies: Path | None) -> str:
     module, func = ENTRY_POINTS[name]
     # Profile boot repairs shared launchers: their default must stay at the
@@ -476,6 +491,7 @@ def _launcher_script(name: str, repo_root: Path, dependencies: Path | None) -> s
         "import contextlib, hashlib, io, pathlib, shutil, subprocess\n"
         "os.environ.pop('PYTHONHOME', None)\n"
         "os.environ.pop('PYTHONPATH', None)\n"
+        + _local_patch_launch_guard(repo_root) +
         f"sys.path.insert(0, {root!r})\n"
         + closure_repair +
         "if sys.argv[1:2] == ['--print-runtime-command']:\n"

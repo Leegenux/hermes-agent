@@ -42,6 +42,25 @@ native_write_started = ContextVar('native_write_started', default=False)
 messaging_admission = ContextVar('messaging_admission', default=None)
 
 
+@dataclass(frozen=True)
+class _ArrivalEpoch:
+    authority: object
+    route: str
+    epoch: int
+
+
+_arrival_epoch = ContextVar('native_arrival_epoch', default=None)
+
+
+def capture_arrival_epoch(runner, source, route):
+    """Capture trusted adapter task context before the processing hook can yield."""
+    from gateway.session_authorities import authority_for_home
+    if runner is None:
+        return None
+    authority = authority_for_home(runner, runner._resolve_profile_home_for_source(source))
+    return _ArrivalEpoch(authority, route, authority.route_epoch(route)) if authority else None
+
+
 @dataclass
 class LiveSession:
     source: object
@@ -519,13 +538,22 @@ class SessionAuthority:
         from gateway.session_automation import admit_automation
         return await admit_automation(self, adapter, event, identity, replaces, fold)
 
-    async def admit_native(self, event):
-        """Await current connector policy, then commit before ACK or scheduling execution."""
+    async def admit_native(self, event, *, _write_settled: asyncio.Future[None] | None = None,
+                           _startup_owner=None):
+        """Await policy, then commit before ACK or scheduling execution.
+
+        The private future observes only the final write task, if one is started; a refusal
+        or cancellation before that point leaves it unresolved. It is not a commit receipt.
+        """
         from gateway.session_ingress_media import abandon_capture, capture_lease
         async with self._route_turn(event) as fence:
             with capture_lease(self) as scope:  # captured bytes are held until commit or refusal
                 try:
-                    return await self._admit_native(event, fence)
+                    if _startup_owner is not None:
+                        return await self._admit_native(event, fence, _startup_owner=_startup_owner)
+                    if _write_settled is None:
+                        return await self._admit_native(event, fence)
+                    return await self._admit_native(event, fence, _write_settled=_write_settled)
                 except BaseException:
                     # Before the shielded write starts, no row can own these bytes. A cancelled copy
                     # arranges its own completion cleanup in prepare_native; other failures clean here.
@@ -549,7 +577,14 @@ class SessionAuthority:
         if key is None:
             yield None
             return
-        arrived = self.route_epoch(key)
+        arrival = _arrival_epoch.get()
+        _arrival_epoch.set(None)  # a drain or a later independent input must not inherit it
+        if ingress is not None and arrival is not None:
+            if arrival.authority is not self or arrival.route != key:
+                raise RuntimeStoreError('stale_generation', field='route', detail='arrival route changed')
+            arrived = arrival.epoch
+        else:
+            arrived = self.route_epoch(key)
 
         def fence(_conn=None):
             if self.route_epoch(key) != arrived:
@@ -573,7 +608,7 @@ class SessionAuthority:
         turn read before it (``_stop_epoch``), never commit."""
         self._route_epochs[route] = self.route_epoch(route) + 1
 
-    async def _admit_native(self, event, fence=None):
+    async def _admit_native(self, event, fence=None, *, _write_settled=None, _startup_owner=None):
         import json
         from gateway.session_envelope import prepare_native, restore_native_source
         self._require_admission_open()
@@ -603,12 +638,15 @@ class SessionAuthority:
         if (scope := _lease_scope.get()) is not None:
             scope.write_started = True
         native_write_started.set(True)  # shielded from here: a cancelled caller may still commit
+        if _startup_owner is not None:
+            _write_settled = _startup_owner.write_settled
         return await tracked_write(self, partial(
             self._admit_native_write, principal_id='messaging:' + identity, session_id=ref.session_id,
             request_id=request_id, payload=payload,
             authorize=session_retry_admission.compose(rewrite, self._admission_gate(fence)),
             raw=getattr(event, 'raw_message', None)),
-            then=admitted, ordered=True, after=lambda _receipt: self._schedule_admitted(committed[0]))
+            then=admitted, ordered=True, after=lambda _receipt: self._schedule_admitted(committed[0]),
+            settled=_write_settled, _startup_owner=_startup_owner)
 
     def _admit_native_write(self, *, principal_id, session_id, request_id, payload, authorize, raw=None):
         # Off the loop and in admission order: the redelivery reconcile reads the ledger it decides
@@ -843,6 +881,9 @@ class SessionAuthority:
         # the admission (native delivery, API/webhook/hosted waiters, ACP and viewer streams)
         # settles here, or a cancelled row that never reaches _drain blocks them forever.
         live = self.sessions[ref.session_id]
+        published = getattr(self, '_cancel_published', None)
+        if published is None:
+            published = self._cancel_published = set()
         with live.event_stream.lock:
             self._publish_pending(ref)
             running = live.event_stream.execution
@@ -850,8 +891,12 @@ class SessionAuthority:
             # completion is not attributed to the turn currently running ahead of it.
             live.event_stream.execution = {'authority_epoch': self.epoch, 'admission_id': admission_id}
             try:
-                live.event_stream.publish(ref.session_id, {
-                    'text': '', 'content': '', 'admission_id': admission_id, 'outcome': outcome})
+                if admission_id not in published:
+                    live.event_stream.publish(ref.session_id, {
+                        'text': '', 'content': '', 'admission_id': admission_id, 'outcome': outcome})
+                    # Publication and remaining observer cleanup have separate retry boundaries.
+                    # A later schedule failure must not emit this completion again.
+                    published.add(admission_id)
             finally:
                 live.event_stream.execution = running
         # Published once: a later exact retry re-collects media but never repeats the completion.
@@ -931,11 +976,72 @@ class SessionAuthority:
         self._schedule(ref)
         return self._receipt(row)
 
-    async def interrupt(self, actor, ref, generation):
+    async def record_collab_stop(self, session_id, *, reason: str = "root_stopped") -> bool:
+        """A native explicit Stop admission -> durable collaboration stop before turn exit.
+
+        Called by ``interrupt`` (messaging and API stop, which never carries the gateway-shutdown
+        issuer) and by an idle messaging ``/stop``. No tree -> no-op. Queued native wakes are
+        cancelled after the durable stop, so a crash cannot leave a wake that runs later.
+        """
+        sid = str(session_id or "")
+        if not sid:
+            return False
+        root_agent = None
+        try:
+            if sid in self.sessions:
+                root_agent = self.agent(SessionRef(self.profile_id, sid))
+        except Exception:  # health: allow BLE001 -- inbox cleanup is best effort
+            root_agent = None
+        # Compression advances the live agent to a physical tip while this Stop names the FIFO's
+        # lineage root. A message admitted after the rotation registers its tree under the tip,
+        # so stopping only ``sid`` would leave the current tree active and a later message could
+        # resurrect work the person stopped. Close every tree in the lineage (and the tip).
+        tree_ids = [sid]
+        for attr in ("get_compression_lineage", "get_compression_tip"):
+            try:
+                value = getattr(self.db, attr)(sid)
+            except Exception:  # health: allow BLE001 -- the id itself is always tried
+                continue
+            values = value if isinstance(value, (list, tuple)) else [value]
+            for candidate in values:
+                if isinstance(candidate, str) and candidate and candidate not in tree_ids:
+                    tree_ids.append(candidate)
+        stopped = False
+        try:
+            from tools.delegate_tool_messages import note_user_stop
+            for tree_id in tree_ids:
+                if await asyncio.to_thread(
+                        note_user_stop, str(self.db.db_path), tree_id, reason,
+                        root_agent=root_agent):
+                    stopped = True
+        except Exception:  # health: allow BLE001 -- the native interrupt must still proceed
+            import logging
+            logging.getLogger(__name__).warning(
+                "durable collaboration stop failed for %s", sid, exc_info=True)
+        if stopped:
+            try:
+                from tools.delegate_tool_wake import cancel_root_wakes
+                # Admissions are keyed by the FIFO/lane identity; try each lineage id so a
+                # compressed root's queued wake is cancelled whatever id the caller held.
+                for tree_id in tree_ids:
+                    await asyncio.to_thread(cancel_root_wakes, str(self.db.db_path), tree_id)
+            except Exception:  # health: allow BLE001 -- the durable stop already stands
+                import logging
+                logging.getLogger(__name__).warning(
+                    "cancelling queued collaboration wakes failed for %s", sid, exc_info=True)
+        return bool(stopped)
+
+    async def interrupt(self, actor, ref, generation, *, control_id=None):
         self.authorize(actor, ref, 'session:control')
         handle = self._handle(ref)
         if handle.execution_generation != generation:
             raise RuntimeStoreError('stale_generation')
+        from gateway.session_report_controls import fence_reports
+        await fence_reports(self, ref.session_id, control_id)
+        # Record the person's Stop durably at admission, before the turn can exit and before a
+        # queued wake can be claimed. Gateway shutdown never comes through here (it calls
+        # request_hard_interrupt with the shutdown issuer), so resumable work stays resumable.
+        await self.record_collab_stop(ref.session_id)
         live, agent = self.sessions[ref.session_id], None
         if handle.execution_state == 'running':
             # Latches are written under the lock adopt_agent takes on the executor thread, BEFORE the

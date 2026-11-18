@@ -1196,6 +1196,19 @@ auxiliary:
 The summary model **must** have a context window at least as large as your main agent model's. The compressor sends the full middle section of the conversation to the summary model — if that model's context window is smaller than the main model's, the summarization call will fail with a context length error. When this happens, the middle turns are **dropped without a summary**, losing conversation context silently. If you override the model, verify its context length meets or exceeds your main model's.
 :::
 
+## Codex request compression
+
+Official Codex Responses requests use plain JSON by default. Set the boolean
+`agent.codex_request_compression` to `true` to opt in to zstd request compression;
+Python 3.14 or newer with the stdlib zstd codec is required. Other providers,
+non-Responses requests, and requests that already have a Content-Encoding are
+not compressed by this hook. Existing clients read this setting when built.
+
+```yaml
+agent:
+  codex_request_compression: false
+```
+
 ## Gateway Turn Lease Timeout
 
 The gateway serializes turns by their resolved session ID so two routing keys
@@ -3186,6 +3199,9 @@ delegation:
   max_spawn_depth: 1                        # Delegation tree depth cap (1-3, clamped). 1 = flat (default): parent spawns leaves that cannot delegate. 2 = orchestrator children can spawn leaf grandchildren. 3 = three levels.
   orchestrator_enabled: true                # Global kill switch. When false, role="orchestrator" is ignored and every child is forced to leaf regardless of max_spawn_depth.
   oneshot_max_children: 2                   # Total subagents a one-shot run (hermes chat -q / --oneshot) may spawn; 0 = unlimited. Interactive and gateway sessions are never capped by this.
+  resumable_ttl_hours: 48                   # A child stopped by a restart, crash or provider failure stays continuable (delegate_task action=continue) this long, and its worktree is kept from the startup sweep.
+  max_resumable: 32                         # Per profile, how many such children keep their worktree pinned; the oldest beyond it loses its pin (the record stays).
+  auto_resume: false                        # Opt-in: resume such children automatically. Off = you continue them.
   gateway_mode: auto                        # Gateway sessions: auto | inline | background. auto = join children inside the turn (one answer) on a messaging chat whose display.interim_assistant_messages is off. See Subagent Delegation → Messaging chats without interim messages.
 ```
 

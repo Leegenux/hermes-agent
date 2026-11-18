@@ -424,14 +424,32 @@ def _slack_dm_chat_id(pconfig, chat_id):
 
 
 def _mirror_sent_message(platform_name, chat_id, mirror_text, thread_id):
-    """Best-effort mirror of the sent message into the target's gateway session."""
+    """Mirror the sent message into the target's gateway session.
+
+    ``ensure_destination_session`` first CREATES the target session when nobody has spoken there
+    yet (a fresh topic/thread, a first-contact DM): the mirror only appends, so without it the
+    greeting never enters history and the reply that follows starts empty."""
     try:
+        from gateway.config import Platform
         from gateway.mirror import mirror_to_session
         from gateway.session_context import get_session_env
+        from gateway.session_seed import ensure_destination_session
+        user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
+        try:
+            _runner, adapter = _live_adapter(Platform(str(platform_name).lower()))
+        except Exception:
+            adapter = None
+        if adapter is None:
+            # No running gateway (``hermes send`` from a shell, cron CLI): the state store is still
+            # on disk and is exactly what the reply will open, so seed into a store-only stand-in
+            # instead of dropping the greeting.
+            adapter = _offline_seed_store()
         return bool(mirror_to_session(
             platform_name, chat_id, mirror_text, thread_id=thread_id,
             source_label=get_session_env("HERMES_SESSION_PLATFORM", "cli"),
-            user_id=get_session_env("HERMES_SESSION_USER_ID", "") or None))
+            user_id=user_id,
+            session_id=ensure_destination_session(
+                platform_name, chat_id, thread_id=thread_id, user_id=user_id, adapter=adapter)))
     except Exception:
         return False
 
@@ -446,6 +464,25 @@ def _weixin_env_pconfig():
     return PlatformConfig(enabled=True, token=wx_token, extra={
         "account_id": wx_account, "base_url": get_secret("WEIXIN_BASE_URL", "").strip(),
         "cdn_base_url": get_secret("WEIXIN_CDN_BASE_URL", "").strip()})
+
+
+def _offline_seed_store():
+    """Store-only adapter stand-in for a send that has no live gateway behind it.
+
+    ``ensure_destination_session`` needs a store and nothing else; ``build_source`` is optional
+    (``session_seed.delivery_source`` falls back to a bare ``SessionSource``)."""
+    try:
+        from pathlib import Path
+        from gateway.config import load_gateway_config
+        from gateway.session import SessionStore
+        from hermes_constants import get_hermes_home
+        return type("_OfflineSeedStore", (), {
+            "_session_store": SessionStore(Path(get_hermes_home()) / "sessions",
+                                          load_gateway_config())})()
+    except Exception:
+        logger.warning("offline seed store unavailable — the greeting will not be recorded",
+                       exc_info=True)
+        return None
 
 
 def _describe_media_for_mirror(media_files):

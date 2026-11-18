@@ -195,6 +195,8 @@ def effective_stop_drain_timeout(runner: object) -> float:
     getattr-guarded on purpose: shutdown-path tests drive ``_stop_impl``
     from bare doubles that are not ``GatewayRunner`` instances.
     """
+    if getattr(runner, "_restart_force", False):
+        return 0.0
     drain = getattr(runner, "_restart_drain_timeout", DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT)
     if not getattr(runner, "_stop_requested_by_signal", False):
         return drain

@@ -753,6 +753,79 @@ CREATE TABLE IF NOT EXISTS async_delegations (
     origin_session_id TEXT NOT NULL DEFAULT ''
 );
 
+-- Durable subagent records (tools/delegate_tool_resumable.py): what delegate_task(action='continue') rebuilds a
+-- child from after a restart or crash, and the worktree pin the startup sweep honours (``pinned``).
+CREATE TABLE IF NOT EXISTS resumable_subagents (
+    subagent_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    stop_cause TEXT,
+    owner_pid INTEGER,
+    owner_started_at INTEGER,
+    record_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    expires_at REAL
+);
+
+-- Same-tree collaboration (tools/delegate_tool_collab.py): one durable tree policy row, a
+-- message ledger with explicit accepted/delivered/processed states, and the busy-target
+-- next-step inbox. No message body is stored here; the fingerprint covers the body.
+CREATE TABLE IF NOT EXISTS delegate_collab_trees (
+    tree_id TEXT PRIMARY KEY,
+    root_session_id TEXT NOT NULL,
+    profile_key TEXT NOT NULL,
+    state TEXT NOT NULL,
+    max_rounds INTEGER NOT NULL,
+    max_concurrent INTEGER NOT NULL,
+    rounds_used INTEGER NOT NULL DEFAULT 0,
+    stop_reason TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS delegate_collab_messages (
+    message_id TEXT PRIMARY KEY,
+    tree_id TEXT NOT NULL,
+    sender_id TEXT NOT NULL,
+    sender_session_id TEXT,
+    recipient_id TEXT NOT NULL,
+    recipient_session_id TEXT,
+    target_input TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    state TEXT NOT NULL,
+    delivery TEXT,
+    round INTEGER NOT NULL DEFAULT 0,
+    reason TEXT,
+    error TEXT,
+    outcome TEXT,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    accepted_at REAL,
+    delivered_at REAL,
+    processed_at REAL,
+    owner_pid INTEGER,
+    owner_started_at INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS delegate_collab_inbox (
+    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id TEXT NOT NULL UNIQUE,
+    tree_id TEXT NOT NULL,
+    target_id TEXT NOT NULL,
+    target_session_id TEXT,
+    state TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_delegate_collab_messages_tree
+    ON delegate_collab_messages(tree_id, state);
+CREATE INDEX IF NOT EXISTS idx_delegate_collab_messages_active
+    ON delegate_collab_messages(tree_id, delivery, processed_at);
+CREATE INDEX IF NOT EXISTS idx_delegate_collab_inbox_target
+    ON delegate_collab_inbox(tree_id, target_id, state);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
