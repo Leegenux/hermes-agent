@@ -46,13 +46,18 @@ def register_timeout_notice(
     flagged = approval_data.get("description") or ea_default_reason_text()
 
     def settle(reason: str) -> None:
-        if reason != "timeout":
-            return  # answered / interrupted / notify_failed already produced their own feedback
         # Same guard as every other late notice in TurnRunner: after /stop, /new or a restart the
         # turn is over and this chat belongs to a newer run — do not edit or post into it.
         still_current = getattr(runner._ctx, "_run_still_current", None)
         if callable(still_current) and not still_current():
             return
+        from gateway.platforms.typing_scope import set_typing_paused
+        ctx = runner._ctx
+        if hasattr(ctx._status_adapter, 'resume_typing_for_chat'):
+            set_typing_paused(ctx._status_adapter, ctx._status_chat_id, paused=False,
+                              metadata=ctx._status_thread_metadata)
+        if reason != 'timeout':
+            return  # Other outcomes already produced their own feedback.
         runner._schedule(
             _post_timeout_notice(runner._ctx, command, card_message_id, timeout_s, flagged),
             "Approval timeout notice scheduling error")

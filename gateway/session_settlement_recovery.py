@@ -191,7 +191,8 @@ def commit_and_publish(authority, live, ref, row, response, outcome, captured, s
     try:
         settlement['settled'], settlement['response'] = finish_result(
             authority.db, epoch=authority.epoch, row=row, response=response, outcome=outcome,
-            result=captured, prepared=prepared, transfers=transfers)
+            result=captured, prepared=prepared, transfers=transfers,
+            _continuation_authorize=authority._admission_gate())
         with live.event_stream.lock:
             live.settling.pop(admission_id, None)
             _publish_completion(authority, live, ref, row, settlement['settled'], settlement['response'], captured)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import faulthandler
+from functools import partial
 import logging
 import os
 import signal
@@ -38,6 +39,8 @@ from typing import Any, Dict, Optional, Tuple
 logger = logging.getLogger("gateway.run")
 # What adapters' ``get_chat_info`` reports for a chat every member reads (a handoff home that is no DM).
 _HANDOFF_SHARED_CHAT_TYPES = frozenset({"group", "channel", "forum", "room", "supergroup", "thread"})
+# Heuristic coalescing window, not a Telegram API constraint.
+_SEND_PATH_RECOVERY_DEBOUNCE_SECONDS = 1.0
 
 
 def recover_left_core_in(home: Path, *, hydrate_secrets: bool = True) -> list[str]:
@@ -325,9 +328,18 @@ class GatewayStartupMixin:
         claimed = await self._claim_pending_obligations()
 
         async def _boot_sends() -> None:
-            await self._send_restart_notification()
+            # The chat that ran /restart already got "restarted": seed its key so neither this boot
+            # nor the reconnect replay also broadcasts "online" to it. #27870
+            delivered = await self._send_restart_notification()
             if planned_restart_notification_pending:
                 await self._replay_pending_planned_restart_notification()
+            else:
+                # No planned-restart marker: cold boot, supervisor/crash recovery, or a CLI
+                # stop+start (all of Windows). Owe the online notice anyway, throttled; the
+                # replay below and each later reconnect discharge it. #27870
+                await self._send_ordinary_start_notice(
+                    skip_targets={delivered} if delivered else None
+                )
             await self._redeliver_claimed_obligations(claimed)
 
         boot_task = asyncio.create_task(_boot_sends())
@@ -479,7 +491,8 @@ class GatewayStartupMixin:
         # No early return on an empty claim: the boot sweep may have ADOPTED flood-refused rows that are
         # not due yet, and those still need their timer armed below.
         try:
-            from gateway.delivery_ledger import RECOVERED_MARKER, mark_delivered, mark_failed
+            from gateway.delivery_ledger import (
+                RECOVERED_MARKER, is_reconnect_only, mark_delivered, mark_failed)
         except Exception:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
@@ -488,6 +501,9 @@ class GatewayStartupMixin:
             if row.get("adopted"):
                 # Adopted at boot inside its flood wait: its resume flag is cleared with the others, and
                 # the timer armed below sends it once the platform's deadline has passed.
+                continue
+            from gateway.delivery_ledger import report_dispatch_allowed
+            if not await asyncio.to_thread(report_dispatch_allowed, row['obligation_id']):
                 continue
             adapter = await self._obligation_adapter(row)
             if adapter is None:
@@ -510,9 +526,21 @@ class GatewayStartupMixin:
                         row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
                     )
                 else:
-                    await asyncio.to_thread(
-                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
-                    )
+                    error = str(getattr(result, "error", "") or "send failed")
+                    await asyncio.to_thread(mark_failed, row["obligation_id"], error)
+                    if is_reconnect_only(error):
+                        # The adapter used for this claimed send may have been replaced while its
+                        # send/ledger update was in flight. Notify the current legal transport for
+                        # the row's identity; the scheduler still performs its health/identity checks.
+                        try:
+                            platform = Platform(row["platform"])
+                            profile = row.get("profile") or "default"
+                            live_adapter = self._authorization_adapter(platform, profile)
+                        except Exception:
+                            live_adapter = None
+                        if live_adapter is not None:
+                            self._schedule_send_path_recovery(
+                                live_adapter, reason="failed-finalized")
         # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
         # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.
         with _log_suppressed(logging.DEBUG, "arming flood redelivery timers failed", exc_info=True):
@@ -593,6 +621,108 @@ class GatewayStartupMixin:
             await asyncio.to_thread(lambda: [release_runtime_claim(
                 row["obligation_id"], row.get("last_error") or "send_path_degraded") for row in owned])
             raise
+
+    def _schedule_send_path_recovery(self, adapter, *, reason: str = "recovered") -> None:
+        """Coalesce a Telegram send-path recovery into one asynchronous runtime-ledger sweep.
+
+        Progress callbacks run on the gateway loop; this method does no ledger/config work inline.
+        Rows are still claimed and delivered by the existing runtime recovery path.
+        """
+        if getattr(getattr(adapter, "platform", None), "value", None) != "telegram":
+            return
+
+        platform = adapter.platform
+        profile = getattr(adapter, "_owner_profile", None) or "default"
+        key = (platform.value, profile)
+
+        def _eligible(candidate) -> bool:
+            if (not getattr(self, "_running", False) or getattr(self, "_draining", False)
+                    or not getattr(candidate, "is_connected", False)
+                    or getattr(candidate, "has_fatal_error", False)
+                    or getattr(candidate, "send_path_degraded", False)):
+                return False
+            return self._authorization_adapter(platform, profile) is candidate
+
+        if not _eligible(adapter):
+            return
+
+        jobs = getattr(self, "_send_path_recovery_jobs", None)
+        if jobs is None:
+            jobs = self._send_path_recovery_jobs = {}
+        entry = jobs.get(key)
+        if entry is not None and not entry["task"].done():
+            entry["adapter"] = adapter
+            entry["reason"] = reason
+            entry["wake"].set()
+            return
+
+        wake = asyncio.Event()
+        entry = {"adapter": adapter, "reason": reason, "wake": wake, "task": None}
+        jobs[key] = entry
+
+        async def _run() -> None:
+            current = asyncio.current_task()
+            try:
+                while True:
+                    wake.clear()
+                    try:
+                        await asyncio.wait_for(
+                            wake.wait(), timeout=_SEND_PATH_RECOVERY_DEBOUNCE_SECONDS)
+                        continue  # trailing debounce: one quiet window after the last wake
+                    except TimeoutError:
+                        pass
+
+                    candidate = entry["adapter"]
+                    if not _eligible(candidate):
+                        return
+
+                    # Resolve the adapter's transport owner, never the profile of the session that
+                    # happened to cause a delayed failure callback.
+                    from gateway.run import _profile_runtime_scope
+                    if profile == "default":
+                        profile_home = None
+                    else:
+                        profile_home = self._routed_profile_home(profile)
+                        from gateway.run_adapters import UNRESOLVED_PROFILE_HOME
+                        if profile_home is UNRESOLVED_PROFILE_HOME:
+                            return
+                    with self._scope_or_null(
+                        partial(_profile_runtime_scope, hydrate_secrets=False), profile_home):
+                        if not _eligible(candidate):
+                            return
+                        sweep_reason = entry["reason"]
+                        logger.info(
+                            "Send-path recovery sweep begin platform=%s profile=%s reason=%s",
+                            platform.value, profile, sweep_reason)
+                        delivered = await self._redeliver_failed_obligations_for_platform(
+                            platform, profile=profile)
+                        logger.info(
+                            "Send-path recovery sweep end platform=%s profile=%s delivered=%d",
+                            platform.value, profile, delivered)
+
+                    # A wake during the sweep means a newer recovery or a just-committed failure
+                    # needs one coalesced follow-up. No wake means retire without another SELECT.
+                    if not wake.is_set():
+                        return
+            finally:
+                if (jobs.get(key) is entry and entry.get("task") is current):
+                    jobs.pop(key, None)
+
+        task = asyncio.create_task(
+            _run(), name=f"send-path-recovery:{key[0]}:{key[1]}")
+        entry["task"] = task
+        self._retain_background_task(task)
+
+        report_failure = self._late_failure_callback(
+            f"send-path recovery worker failed for {key[0]}:{key[1]}")
+
+        def _retire(finished: asyncio.Task) -> None:
+            # A task cancelled before its coroutine's first turn cannot run its finally block.
+            if jobs.get(key) is entry:
+                jobs.pop(key, None)
+            report_failure(finished)
+
+        task.add_done_callback(_retire)
 
     def _resume_pending_candidates(self, platform=None) -> Optional[list]:
         """Snapshot resume-pending entries (optionally scoped to ``platform``); None when

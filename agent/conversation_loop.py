@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import time
+from contextlib import suppress
 from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional
 
@@ -1643,6 +1644,26 @@ def _codex_app_server_turn(agent: Any, s: Any) -> Optional[dict[str, Any]]:
     return None
 
 
+def _verdict_action(agent, s: _LoopState, verdict) -> str:
+    """Map one phase verdict to the loop action, reopening for a late agent message.
+
+    Kept out of ``_run_conversation_turn`` so that function's branch budget does
+    not grow with a delivery concern that belongs to the inbox module.
+    """
+    if verdict.action != "break":
+        return verdict.action
+    with suppress(Exception):
+        from tools.delegate_tool_messages import reopen_finished_turn_for_inbox, reject_undelivered_inbox
+        if reopen_finished_turn_for_inbox(agent, s.messages):
+            return "continue"
+        # The reopen budget is exhausted (or the run is interrupted): the turn
+        # is over, so anything still queued can no longer be processed. Refuse
+        # it explicitly rather than leaving a false ``accepted`` behind.
+        if getattr(agent, "_delegate_inbox", None):
+            reject_undelivered_inbox(agent, "target_finished_before_delivery")
+    return "break"
+
+
 def _run_conversation_turn(
     agent,
     user_message: Any,
@@ -1730,6 +1751,7 @@ def _run_conversation_turn(
     # pool refresh tallies cap same-entry refreshes on a persistent 401 (#26080); usage
     # for on_turn_complete() stays None on turns that never reach a response.
     agent._delivered_interim_texts = set()
+    agent._delegate_inbox_reopens = 0
     agent._incremental_persistence_failed = False
     agent._last_persistence_error_cause = None
     agent._compression_adoption_failed = False
@@ -1787,11 +1809,12 @@ def _run_conversation_turn(
             _v = _run_phase(
                 run_tool_round if s.assistant_message.tool_calls else finish_text_response, agent, s
             )
-            if _v.action == "return":
+            _action = _verdict_action(agent, s, _v)
+            if _action == "return":
                 return _v.result
-            if _v.action == "break":
+            if _action == "break":
                 break
-            if _v.action == "continue":
+            if _action == "continue":
                 continue
         except Exception as e:
             if _run_phase(handle_outer_loop_error, agent, s, e=e).action == "break":
@@ -1864,6 +1887,9 @@ def run_conversation(
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))
     _close_durable_failed_turn(agent, result)
+    with suppress(Exception):
+        from tools.delegate_tool_messages import finish_collaboration_run
+        finish_collaboration_run(agent, result)
     return result
 
 

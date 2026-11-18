@@ -402,7 +402,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             _clarify_adapter = self._delivery_adapter_for(source)
             if _clarify_adapter:
                 try:
-                    _clarify_adapter.resume_typing_for_chat(source.chat_id)
+                    from gateway.platforms.typing_scope import set_typing_paused
+                    set_typing_paused(_clarify_adapter, source.chat_id, paused=False, metadata={"thread_id": source.thread_id})
                 except Exception:
                     logger.debug("Failed to resume typing after clarify response", exc_info=True)
                 # A typed answer to a native card (numeric pick, or text after "Other") never
@@ -637,7 +638,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             if _denied is not None:
                 return True, _denied
             if _cmd_def_inner.name in ("stop", "new"):
-                await self._hm_stop_owner_turn(_quick_key)
+                await self._hm_stop_owner_turn(_quick_key, event=event)
             # Any recognized slash command dispatches per its declared busy_policy (dispatch /
             # interrupt_then_dispatch / reject). Unrecognized commands and plain text fall through.
             return True, await self._dispatch_busy_slash_command(event, _cmd_def_inner, _quick_key, source)
@@ -657,7 +658,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if (adapter := self._intake_adapter_for(event.source)) is not None:
             adapter._discard_text_debounce(adapter._event_session_key(event))
 
-    async def _hm_stop_owner_turn(self, _quick_key: str) -> None:
+    async def _hm_stop_owner_turn(self, _quick_key: str, *, event=None) -> None:
         """Messaging /stop and /new (busy, idle or confirmed) act on the authority's turn, as main
         cancelled the adapter task that ran it and dropped its pending slot. Cancels the still-queued
         ``messaging:*`` rows of this route's logical owner first (automation wakes, LOCAL/API input
@@ -666,14 +667,30 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
         sid = authority.logical_owner(self.session_store.peek_session_id(_quick_key)) if authority else None
-        if not sid or sid not in authority.sessions:
+        if not sid:
             if authority is not None:
                 # The chat's first input, and a command's turn, not committed yet never commit.
                 authority.fence_route(_quick_key)
             return
+        from gateway.session_report_controls import command_control_id, fence_reports
+        control_id = command_control_id(event) if event is not None else None
+        details = await fence_reports(authority, sid, control_id)
+        # The second entry (interrupt below, or slash dispatch) reuses this committed control.
+        control_id = details['control_id']
+        if sid not in authority.sessions:
+            # The chat's first input, and a command's turn, not committed yet never commit. The
+            # durable collaboration stop is still recorded: after a gateway restart the route is
+            # not mounted until a message arrives, and a person's Stop must not be forgotten just
+            # because no live generation exists to interrupt.
+            await authority.record_collab_stop(sid)
+            authority.fence_route(_quick_key)
+            return
         from gateway.session_contract import SessionActor, SessionRef
         from hermes_state_runtime import RuntimeStoreError, list_session_admissions
         ref = SessionRef(authority.profile_id, sid)
+        # A person's /stop or /new is terminal for this tree, including when the root is idle and
+        # there is no running generation to interrupt. Recorded before queued work is cancelled.
+        await authority.record_collab_stop(sid)
         actor = SessionActor('messaging-control', authority.profile_id,
                           frozenset({'session:submit', 'session:control'}), 'busy-command')
         rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=sid)
@@ -695,7 +712,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if handle.execution_state == 'running':
             # Settled meanwhile (stale_generation): there is no claimed turn left to stop.
             with suppress(RuntimeStoreError):
-                await authority.interrupt(actor, ref, handle.execution_generation)
+                await authority.interrupt(actor, ref, handle.execution_generation, control_id=control_id)
 
     def _hm_busy_telegram_grace_queue(
         self, event: MessageEvent, source: SessionSource, _quick_key: str, effective_busy_input_mode: str
@@ -1310,6 +1327,13 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         _consumed, _consumer_reply = await self._hm_post_admission_consume(event, source, _quick_key)
         if _consumed:
             return True, _consumer_reply
+        owner = getattr(event, '_native_startup_owner', None)
+        if owner is not None:
+            from gateway.session_ingress import busy_acceptance
+            accepted = busy_acceptance.get()
+            if owner.previous is not None and not owner.previous.ready.done() and accepted is not None and not accepted.done():
+                accepted.set_result(None)  # its arrival position is fixed; durability still waits for commit
+            await owner.wait_previous(authority, _quick_key)
         if getattr(event, "_fifo_only", False) and event._stop_epoch != self._route_stop_epoch(_quick_key):
             return True, None  # a /stop or /new came after its command, as it clears the slot
         # A failed admit stays the authority's answer (refusal notice or turn error), never a

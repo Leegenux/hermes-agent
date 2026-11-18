@@ -306,12 +306,18 @@ Semantics are honest at-least-once:
   attempt or re-running the agent. Retries retain the original bot profile, chat
   and thread. A rate-limit recovery prefix warns that earlier chunks may already
   have arrived; the ledger cannot infer partial delivery from message length.
-- Any other rejected final send (a platform 5xx, an unclassified error) is retried the same
-  way after a growing backoff (30 s, then 2 min); the last budgeted attempt is left for the
-  next gateway start, so an outage that outlasts the timer never strands the reply. A
-  permanently unreachable chat (blocked bot, deleted group) is not retried.
-- Redelivery is bounded: 3 attempts, 24-hour freshness, then the row is
-  abandoned. Delivered rows are pruned after 7 days.
+- Any other rejected final send (a platform 5xx, an unclassified error) is retried after
+  30 s, then at a capped 2 min interval. A permanently unreachable chat (blocked bot,
+  deleted group) is not retried.
+- The ledger permits at most 20 replay attempts, with the last attempt reserved for boot
+  recovery. Runtime retries stop after 19 claims or 30 minutes from the original reply;
+  stopping runtime retries retains the failed row rather than abandoning the boot reserve.
+  Boot recovery retains the existing 24-hour freshness cutoff and process-ownership checks.
+  Recorded flood-control penalties keep their 24-hour runtime window so a longer
+  platform-mandated wait is not shortened; the final attempt is still reserved for boot.
+  Sweeps abandon rows after the total budget or 24-hour cutoff; delivered rows are pruned
+  after 7 days. An attempt counts a ledger claim, not every inline HTTP retry.
+  Ambiguous sends can still produce duplicates; a recovery marker is not exactly-once.
 
 Disable with `gateway.delivery_ledger: false` in `config.yaml` (restores the
 old behavior: in-flight responses are lost on crash).
@@ -902,6 +908,10 @@ gateway:
 ```
 
 Disable it on noisy or low-priority platforms while leaving it on for your primary chat. The notification is sent once per restart, regardless of how many sessions were in flight.
+
+Every start announces itself, not just a restart: a cold boot, a crash or supervisor respawn, and a `hermes gateway stop` followed by `hermes gateway start` send the same "the agent is back" message to each configured home channel. There is no separate switch for this — the same per-platform `gateway_restart_notification: false` opt-out covers both the restart notice and the ordinary-start notice, and an install with no home channel configured gets no message (nothing is logged as an error either). To keep a crash loop from paging you, at most one such notice goes out per 5 minutes per install; the window is the `sent_at` timestamp in `.startup_notice.json` under the gateway's Hermes home.
+
+A plain CLI session (`hermes`, `hermes -q`, the TUI) never sends this notification, and that is deliberate: home channels and the platform transports exist only inside the gateway process, so a CLI start has no destination and no delivery path. Use `hermes gateway status` to check whether the gateway itself is alive.
 
 ### Typing indicators
 

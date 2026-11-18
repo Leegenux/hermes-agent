@@ -276,7 +276,8 @@ class GatewaySlashCommandsMixin(
         source = event.source
         adapter = self._delivery_adapter_for(source)  # the receiving bot, not the default profile's
         if adapter:
-            adapter.resume_typing_for_chat(source.chat_id)  # agent is about to continue
+            from gateway.platforms.typing_scope import set_typing_paused
+            set_typing_paused(adapter, source.chat_id, paused=False, metadata={"thread_id": source.thread_id})
         if getattr(adapter, "SUPPORTS_NATIVE_STREAMING", False) is not True:
             return confirmation_text
         if adapter:
@@ -436,7 +437,7 @@ class GatewaySlashCommandsMixin(
         source = event.source
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
-        await self._hm_stop_owner_turn(session_key)  # also between turns, before the next claim (N53)
+        await self._hm_stop_owner_turn(session_key, event=event)  # same stop identity through busy/slash
 
         async def _stop(key: str, invalidation_reason: str) -> None:
             await self._interrupt_and_clear_session(
@@ -553,9 +554,33 @@ class GatewaySlashCommandsMixin(
                         src.platform.value if src and src.platform else "?",
                         event.platform_update_id)
             return ""
-        if self._restart_requested or self._draining:
+        force = "force" in (event.get_command_args() or "").lower().split()
+        if (self._restart_requested or self._draining) and not force:
             count = self._running_agent_count()
             return t("gateway.draining", count=count) if count else EphemeralReply(t("gateway.restart.in_progress"))
+
+        # Surface parity with the CLI's live-work guard (hermes_cli/gateway_lifecycle_guards):
+        # in-chat /restart used to start the drain unannounced, so a busy gateway looked hung for up
+        # to restart_after_turn_timeout. Name the work; `/restart force` is the existing escape hatch.
+        if not force:
+            work = self._drain_work_counts()
+            if any(work):
+                labels = ("agent", "cron", "api", "deferred")
+                breakdown = ", ".join(f"{n} {label}" for label, n in zip(labels, work) if n)
+                # Counts stay out of the catalog sentence, on purpose: a count noun needs CLDR plural
+                # agreement (ar has six categories, ru/uk three) and t() selects no plural form, so a
+                # translated "3 task(s)" can only be wrong. The catalog's existing `_one`/`_other` rule
+                # picks one of two forms on `count == 1`, which cannot express six either. The detail
+                # line is code-built labels no catalog translates, and keeping it on its own line keeps
+                # an LTR run out of an RTL sentence, where the bidi algorithm reorders it around the
+                # sentence's punctuation.
+                from gateway.restart_blocker_report import restart_blocker_lines
+                try:
+                    current_key = self._session_key_for_source(event.source)
+                except Exception:
+                    current_key = None
+                details = await restart_blocker_lines(self, current_key)
+                return "\n".join([t('gateway.restart.blocked'), breakdown, *details])
 
         async def _write_marker(name: str, build, label: str) -> None:
             try:
@@ -587,17 +612,20 @@ class GatewaySlashCommandsMixin(
         # so a delayed Telegram redelivery is still detectable. Overwritten on every /restart.
         await _write_marker(".restart_last_processed.json", _dedup_payload, "dedup marker")
         active_agents = self._running_agent_count()
-        # Idle: teardown is immediate and a RETURNED ack raced the adapter disconnect (lost on a real
-        # Bot API round trip, #65057), so deliver it first. Draining: the drain waits, the reply lands.
+        # Idle and force: teardown is immediate, so await the ack before requesting restart
+        # (#65057). Only an ordinary draining restart leaves time for the returned reply.
         from gateway.restart_ack import send_restart_ack
-        ack = t("gateway.draining", count=active_agents) if active_agents else EphemeralReply(t("gateway.restart.restarting"))
-        sent = not active_agents and await send_restart_ack(self, self._delivery_adapter_for(event.source), event, ack)
+        ack = (t("gateway.draining", count=active_agents) if active_agents and not force
+               else EphemeralReply(t("gateway.restart.restarting")))
+        sent = (force or not active_agents) and await send_restart_ack(
+            self, self._delivery_adapter_for(event.source), event, ack)
         # Under a service manager (systemd/launchd) or Docker/Podman, exit 75 so the supervisor /
         # restart policy restarts us — detached setsid+bash fails there (systemd KillMode=mixed kills
         # the cgroup; tini exits with the gateway). The explicit marker covers ``sudo env -i`` wrappers.
         from gateway.restart import is_container_restart_context, is_gateway_supervisor_process
         via_service = is_gateway_supervisor_process() or is_container_restart_context()
-        self.request_restart(detached=not via_service, via_service=via_service)
+        restart_kwargs = {"force": True} if force else {}
+        self.request_restart(detached=not via_service, via_service=via_service, **restart_kwargs)
         return None if sent else ack
 
     async def _handle_autoprune_command(self, event: MessageEvent) -> str:

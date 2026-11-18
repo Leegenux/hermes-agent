@@ -20,6 +20,7 @@ from typing import Any, Dict, Optional, cast
 from agent.i18n import t
 from agent.retry_utils import jittered_backoff
 from gateway.config import Platform, _BUILTIN_PLATFORM_VALUES
+from gateway.platforms.base_media_notes import stage_media_failure_note
 from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource, SessionStore
@@ -291,23 +292,41 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
                     images.extend(url_images)
-                    await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
+                    result = await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
+                else:
+                    if not getattr(result, "success", False):
+                        logger.warning("[%s] Post-stream image batch delivery failed: %s",
+                                       adapter.name, getattr(result, "error", "unknown error"))
+                        for image_path in image_paths:
+                            stage_media_failure_note(adapter, event, image_path, result)
+                            await adapter._notify_media_delivery_failure(
+                                chat_id, image_path, metadata=_thread_meta)
             for media_path, is_voice in non_image_media:
                 try:
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
-                        await adapter.send_voice(
+                        result = await adapter.send_voice(
                             chat_id=chat_id, audio_path=media_path, metadata=_thread_meta, is_voice=is_voice,
                         )
                     elif ext in _VIDEO_EXTS:
-                        await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
+                        result = await adapter.send_video(
+                            chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
                     else:
-                        await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                        result = await adapter.send_document(
+                            chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
-
+                    continue
+                # The send returns the platform's code/message; dropping it made a failed upload
+                # a silent drop (Feishu 99992402 on thread-routed media). Report it both ways.
+                if not getattr(result, "success", False):
+                    logger.warning("[%s] Post-stream media delivery failed for %s: %s",
+                                   adapter.name, media_path, getattr(result, "error", "unknown error"))
+                    stage_media_failure_note(adapter, event, media_path, result)
+                    await adapter._notify_media_delivery_failure(
+                        chat_id, media_path, is_voice=is_voice, metadata=_thread_meta)
 
     async def _deliver_queued_first_response(
         self, response: str, source: SessionSource, adapter,
@@ -410,7 +429,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         return result
 
     async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
-        """Notify the chat that initiated /restart that the gateway is back."""
+        """Notify the chat that initiated /restart that the gateway is back.
+
+        Returns the served notice key of the chat it reached, so the boot pass can seed the
+        ordinary-start marker with it and not announce "online" to that chat a second time (#27870).
+        """
         from gateway.delivery import resolve_delivery_transport
         from gateway.run import _hermes_home, _non_conversational_metadata
         notify_path = _hermes_home / ".restart_notify.json"
@@ -424,10 +447,11 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if not platform_str or not chat_id:
                 return None
             platform = Platform(platform_str)
+            profile = self._marker_profile(data)
             # Relay-aware transport over the REQUESTER'S profile adapter map; ``self.adapters`` is the
             # default profile's, so a secondary's "restarted" notice would leave through the wrong bot.
             transport = resolve_delivery_transport(
-                platform, self.config, self._adapters_for_profile(self._marker_profile(data)))
+                platform, self.config, self._adapters_for_profile(profile))
             if transport is None:
                 logger.debug("Restart notification skipped: no live transport for %s", platform_str)
                 return None
@@ -455,7 +479,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 )
                 return None
             logger.info("Sent restart notification to %s:%s", platform_str, chat_id)
-            return str(platform_str), str(chat_id), str(thread_id) if thread_id else None
+            return _served_notice_target_key(profile, str(platform_str), chat_id, thread_id)
         except Exception as e:
             logger.warning("Restart notification failed: %s", e)
             return None
@@ -610,6 +634,46 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 delivered.add(target)
                 logger.info("Sent home-channel startup notification to %s:%s", platform.value, home.chat_id)
         return delivered
+
+    async def _send_ordinary_start_notice(
+        self, *, skip_targets: Optional[set[tuple]] = None
+    ) -> None:
+        """Owe the online notice on an ORDINARY start — the no-marker path (#27870).
+
+        The planned-restart marker only exists when the previous process went down *for a restart*,
+        so a cold boot, a supervisor/crash recovery and a CLI ``stop`` + ``start`` (all of Windows)
+        reached the boot pass with nothing owed and stayed silent. Rather than send once here, this
+        stamps the same marker the restart path uses, so the existing replay discharges it: now for
+        every live home channel, and again from ``_schedule_planned_restart_replay`` when a platform
+        that was offline at boot comes back (#112109). The throttle keeps a crash loop from owing —
+        and therefore paging — on every attempt (#60438).
+
+        Owner check first, throttle second: a process that attached to a live gateway announces
+        nothing AND must not burn the throttle window the owner's next real start needs.
+
+        ``skip_targets`` are chats a more specific notice already reached on this boot (the chat that
+        ran ``/restart``); seeding them into the marker keeps them out of this notice and its replay.
+        """
+        from gateway.restart_notice import write_planned_restart_marker
+        from gateway.run import _planned_restart_notification_path
+        from gateway.startup_notice import (
+            another_gateway_owns_this_home,
+            should_send_startup_notice,
+            stamp_startup_notice,
+        )
+
+        if another_gateway_owns_this_home():
+            logger.info("Ordinary-start home-channel notification skipped: another gateway owns this home")
+            return
+        if not should_send_startup_notice():
+            logger.info("Ordinary-start home-channel notification throttled")
+            return
+        write_planned_restart_marker(delivered_targets=skip_targets)
+        await self._replay_pending_planned_restart_notification()
+        # Still on disk: some home channel is unreached and still owed, so leave the window open
+        # for the next boot or the reconnect replay instead of burning the throttle.
+        if not _planned_restart_notification_path().exists():
+            stamp_startup_notice()
 
     async def _send_session_db_warning_notifications(self) -> None:
         """Broadcast a state.db failure warning to all home channels.

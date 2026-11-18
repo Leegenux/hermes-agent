@@ -121,8 +121,12 @@ class GatewayBusySessionMixin:
             return
         if session_key in pending_slot:
             self._session_state(session_key).conversation.queued_events.append(queued_event)
+            from gateway.pending_trace import trace
+            trace('fifo_enqueue', session_key, queued_event, producer='runner_fifo', runner=self)
         else:
             pending_slot[session_key] = queued_event
+            from gateway.pending_trace import trace
+            trace('pending_set', session_key, queued_event, producer='runner_fifo', runner=self)
         queued_event._gateway_accepted = True
 
     def _promote_queued_event(
@@ -137,9 +141,15 @@ class GatewayBusySessionMixin:
         if not overflow:
             return pending_event
         if pending_event is None:
-            return overflow.pop(0)
+            promoted = overflow.pop(0)
+            from gateway.pending_trace import trace
+            trace('fifo_promote', session_key, promoted, producer='runner_fifo', runner=self)
+            return promoted
         if adapter is not None and hasattr(adapter, "_pending_messages"):
-            adapter._pending_messages[session_key] = overflow.pop(0)
+            promoted = overflow.pop(0)
+            adapter._pending_messages[session_key] = promoted
+            from gateway.pending_trace import trace
+            trace('fifo_promote', session_key, promoted, producer='runner_fifo', runner=self)
         # else: no adapter — leave the head in place so we don't silently drop it.
         return pending_event
 
@@ -183,7 +193,11 @@ class GatewayBusySessionMixin:
         staged = pending_slot.get(session_key)
         if staged is not None:
             self._session_state(session_key).conversation.queued_events.insert(0, staged)
+            from gateway.pending_trace import trace
+            trace('fifo_requeue_staged', session_key, staged, producer='runner_fifo', runner=self)
         pending_slot[session_key] = event
+        from gateway.pending_trace import trace
+        trace('fifo_requeue_front', session_key, event, producer='runner_fifo', runner=self)
     def _take_wake_admitted_before_drain(self, session_key: str, adapter: Any) -> Optional[MessageEvent]:
         """Pop the first wake admitted before the drain began from the pending slot, else from the
         overflow FIFO, keeping the slot filled while overflow remains; every other event stays
@@ -191,11 +205,17 @@ class GatewayBusySessionMixin:
         the drain rejects must not strand it."""
         slot = getattr(adapter, "_pending_messages", None)
         if slot and getattr(slot.get(session_key), "_admitted_before_drain", False) is True:
-            return self._promote_queued_event(session_key, adapter, slot.pop(session_key))
+            event = slot.pop(session_key)
+            from gateway.pending_trace import trace
+            trace('fifo_wake_take', session_key, event, producer='runner_fifo', runner=self)
+            return self._promote_queued_event(session_key, adapter, event)
         overflow = self._overflow_queue(session_key) or []
         for index, event in enumerate(overflow):
             if event._admitted_before_drain is True:
-                return overflow.pop(index)
+                event = overflow.pop(index)
+                from gateway.pending_trace import trace
+                trace('fifo_wake_take', session_key, event, producer='runner_fifo', runner=self)
+                return event
         return None
 
     def _defer_past_exhaustion_reset(
@@ -214,6 +234,8 @@ class GatewayBusySessionMixin:
             pending_event = self._carry_over_event(session_key, source, leftover_steer)
         adapter._pending_messages[session_key] = pending_event
         logger.info("Deferring queued follow-up for session %s until after its compression-exhausted reset", session_key)
+        from gateway.pending_trace import trace
+        trace('fifo_defer_reset', session_key, pending_event, producer='runner_fifo', runner=self)
 
     def _merge_leftover_steer(
         self, result: Any, adapter: Any, source: SessionSource, session_key: Optional[str],
@@ -243,6 +265,8 @@ class GatewayBusySessionMixin:
                         overflow.insert(0, pending_event)
                     else:
                         self._session_state(session_key).conversation.queued_events.insert(0, pending_event)
+                from gateway.pending_trace import trace
+                trace('fifo_restore_steer', session_key, pending_event, producer='runner_fifo', runner=self)
                 pending_event = None
                 pending = leftover_steer
                 logger.debug(
@@ -284,10 +308,14 @@ class GatewayBusySessionMixin:
             if not isinstance(pending_slot, dict) or pending_slot.get(session_key):
                 return None  # slot occupied (busy) or no slot storage — promotion owns this
             head = overflow.pop(0)
+            from gateway.pending_trace import trace
+            trace('fifo_rescue', session_key, head, producer='runner_fifo', runner=self)
             # Keep the slot occupied so the drain promotes in order and a mid-chain arrival routes
             # to overflow instead of jumping the queue (same invariant as _promote_queued_event).
             if overflow:
-                pending_slot[session_key] = overflow.pop(0)
+                promoted = overflow.pop(0)
+                pending_slot[session_key] = promoted
+                trace('fifo_promote', session_key, promoted, producer='runner_fifo', runner=self)
             logger.warning(
                 "Rescued orphaned FIFO overflow event for idle session "
                 "%s — it was queued during a busy window but the post-turn "
@@ -790,8 +818,14 @@ class GatewayBusySessionMixin:
         to *event*, so the reply must quote it (#115001). Both redirect entry points (busy
         interrupt mode and the priority path) go through here.
         """
+        from gateway.completion_report_scope import redirect_instruction
+        text, report_scope = redirect_instruction(self, session_key, running_agent, text)
         if not self._try_agent_verb(running_agent, "redirect", text, session_key, event=event):
             return False
+        from gateway.pending_trace import trace
+        trace('busy_redirect', session_key, event, agent=running_agent, producer='runner_redirect', runner=self)
+        if report_scope is not None:
+            report_scope['redirected'] = True
         turn = self._fold_into_running_turn(running_agent, session_key, event)
         if turn is None:
             return True  # a newer turn already owns the slot; never re-anchor it
@@ -822,7 +856,7 @@ class GatewayBusySessionMixin:
                 turn.ctx.reply_expected = turn.event.reply_expected
         return turn
 
-    async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent) -> None:
+    async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent, session_key=None) -> None:
         """Interrupt mode: abort in-flight tool calls; the agent loop exits at its next check point."""
         from gateway.run import _build_media_placeholder
         try:
@@ -835,6 +869,8 @@ class GatewayBusySessionMixin:
             elif not _interrupt_text and _media_urls:
                 _interrupt_text = _build_media_placeholder(event)
             running_agent.interrupt(_interrupt_text)
+            from gateway.pending_trace import trace
+            trace('busy_soft_interrupt', session_key, event, agent=running_agent, producer='runner_soft_interrupt', runner=self)
         except Exception:
             pass  # don't let interrupt failure block the ack
 
@@ -1023,7 +1059,7 @@ class GatewayBusySessionMixin:
             effective_mode == "interrupt" and not redirected
             and running_agent and running_agent is not _AGENT_PENDING_SENTINEL
         ):
-            await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent)
+            await self._interrupt_running_agent_for_busy_event(event, adapter, running_agent, session_key=session_key)
 
         # Disabled ack: still process input. Checked before debounce so an undelivered ack never
         # stamps the "last ack" timestamp.

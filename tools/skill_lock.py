@@ -380,6 +380,15 @@ def _argv_refusal(argv: list[str], cwd: str, locked, record, depth: int,
     return next((r for check in _ARGV_CHECKS if (r := check(verb, argv[1:], scope))), None)
 
 
+def _inline_path_text(text: str) -> str:
+    """Match Windows path spellings, including escaped interpreter literals.
+
+    This is textual policy matching, not code execution or a filesystem sandbox.
+    POSIX keeps its case-sensitive names and literal backslashes unchanged.
+    """
+    return re.sub(r"[\\/]+", "/", text).casefold() if os.name == "nt" else text
+
+
 def _code_refusal(code: str, locked, record, cwd: str = "") -> str | None:
     """Inline interpreter code that looks like it writes AND names a locked skill (or the record),
     or runs with its working directory inside one (relative paths)."""
@@ -389,13 +398,14 @@ def _code_refusal(code: str, locked, record, cwd: str = "") -> str | None:
     if cwd and (reason := _hit(cwd, locked, record)):
         return reason
     home, hermes_home = os.path.expanduser("~"), str(get_hermes_home())
-    text = code.replace("$HERMES_HOME", hermes_home).replace("~", home)
+    text = _inline_path_text(code.replace("$HERMES_HOME", hermes_home).replace("~", home))
     skills_root = os.path.realpath(_skill_usage()._skills_dir())
     if ".usage.json" in text:
         return RECORD_REFUSAL
     for name, root in locked:
         rel = os.path.relpath(root, skills_root) if skills_root and _inside(root, skills_root) else ""
-        if root in text or (rel and f"skills/{rel}" in text) or f"skills/{os.path.basename(root)}" in text:
+        root_text, rel_text, leaf_text = map(_inline_path_text, (root, rel, os.path.basename(root)))
+        if root_text in text or (rel_text and f"skills/{rel_text}" in text) or f"skills/{leaf_text}" in text:
             return skill_refusal(name)
     return None
 

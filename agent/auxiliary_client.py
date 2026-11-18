@@ -1549,6 +1549,10 @@ class _CodexCompletionsAdapter:
         return resp_kwargs, model, timeout
 
     def create(self, **kwargs) -> Any:
+        from agent.auxiliary_sync_codex_bridge import create_sync_codex_attempt
+        return create_sync_codex_attempt(self, kwargs)
+
+    def _create_attempt(self, **kwargs) -> Any:
         from hermes_cli.providers import is_actual_route
 
         if is_actual_route(
@@ -1617,7 +1621,8 @@ class _CodexCompletionsAdapter:
             tool_calls=tool_calls_raw or None,
         )
         choice = SimpleNamespace(index=0, message=message, finish_reason=finish_reason)
-        return SimpleNamespace(choices=[choice], model=model, usage=usage)
+        from agent.usage_observer import response_fields
+        return SimpleNamespace(choices=[choice], model=model, usage=usage, **response_fields(final))
 
 
 class _ChatShim:
@@ -1675,7 +1680,14 @@ class CodexAuxiliaryClient:
 
 
 class AsyncCodexAuxiliaryClient(_AsyncAuxiliaryClientBase):
-    pass
+    def __init__(self, sync_wrapper: Any):
+        super().__init__(sync_wrapper)
+        # Native attempts reconstruct only actual SDK clients. Preserve the existing
+        # async shim contract for other Responses-compatible client implementations.
+        from openai import OpenAI
+        if isinstance(sync_wrapper._real_client, OpenAI):
+            from agent.auxiliary_async_codex import AsyncCodexCompletionsAdapter
+            self.chat = _ChatShim(AsyncCodexCompletionsAdapter(sync_wrapper.chat.completions))
 
 
 def _translate_anthropic_response_format(anthropic_kwargs: dict[str, Any], response_format: Any) -> None:
@@ -6651,6 +6663,7 @@ def _validate_llm_response(
         if not choices or not hasattr(choices[0], "message"):
             raise AttributeError("missing choices[0].message")
     except (AttributeError, TypeError, IndexError) as exc:
+        from agent.auxiliary_codex_response import _recover_aux_response_message
         recovered = _recover_aux_response_message(response)
         if recovered is None:
             invalid = InvalidProviderResponseError(
@@ -6783,45 +6796,6 @@ def _unwrap_data_envelope(response: Any, task: str | None = None) -> Any:
         choices=choices,
         usage=data.get("usage"),
     )
-
-
-def _recover_aux_response_message(response: Any) -> Optional[Any]:
-    """Synthesize chat-completions shape from Responses-style text (``output_text``,
-    ``output`` items) that some compatible endpoints return outside ``choices``."""
-    text = _extract_aux_response_text(response)
-    if not text:
-        return None
-    choice = SimpleNamespace(message=SimpleNamespace(content=text), finish_reason=getattr(response, "finish_reason", None) or "stop")
-    try:
-        response.choices = [choice]
-        return response
-    except Exception:
-        return SimpleNamespace(
-            id=getattr(response, "id", ""), model=getattr(response, "model", ""),
-            object=getattr(response, "object", "chat.completion"), choices=[choice],
-            usage=getattr(response, "usage", None),
-        )
-
-
-def _extract_aux_response_text(response: Any) -> str:
-    """Text from Responses-style ``output_text`` or ``output[].content[].text``."""
-    output_text = _field(response, "output_text")
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text.strip()
-    output = _field(response, "output")
-    if not isinstance(output, list):
-        return ""
-    parts: list[str] = []
-    for item in output:
-        item_type = _field(item, "type")
-        if item_type and item_type != "message":
-            continue
-        for part in (_field(item, "content") or []):
-            if _field(part, "type") in {"output_text", "text", None}:
-                text = _field(part, "text")
-                if isinstance(text, str) and text.strip():
-                    parts.append(text.strip())
-    return "\n".join(parts).strip()
 
 
 # Streamed aggregation for progress-hooked aux calls: ``timeout`` becomes an inter-chunk idle
@@ -7998,8 +7972,8 @@ def _should_retry_same_provider(task: Optional[str], failure: aux_errors.Failure
     return True
 
 
-def _primary_failure(req: _PreparedAuxRequest, exc: Exception) -> aux_errors.Failure:
-    return _classify_failure(exc, req.resolved_provider, req.client, req.final_model,
+def _primary_failure(req: _PreparedAuxRequest, exc: Exception, client: Any = None) -> aux_errors.Failure:
+    return _classify_failure(exc, req.resolved_provider, client if client is not None else req.client, req.final_model,
                              req.base_info or req.resolved_base_url)
 
 
@@ -8062,6 +8036,8 @@ def _call_llm_impl(
             # object Relay's managed stream would iterate; the MoA facade wraps it as one chunk.
             return client.chat.completions.create(**kwargs)
         return _relay_sync_stream(client, kwargs, provider=request_provider, api_mode=req.resolved_api_mode)
+    from agent import auxiliary_retry_client
+    retry_route = auxiliary_retry_client.retry_cache_route(req, task, retry_kwargs["main_runtime"], False)
 
     def _primary(**validate_kw: Any) -> Any:
         # Retry on the same provider for a transient transport blip (connection reset / streaming-close /
@@ -8100,10 +8076,11 @@ def _call_llm_impl(
                         "retrying same provider after %.1fs before fallback: %s",
                         task or "call", _attempt, _max_transient_retries, _backoff, failure.error)
             time.sleep(_backoff)
+            client = auxiliary_retry_client.retry_route_client(req, retry_route)
             resp, exc = _outcome(_primary)
             if exc is None:
                 return resp
-            failure = _primary_failure(req, exc)
+            failure = _primary_failure(req, exc, client)
             if not aux_errors.same_provider_retry(failure.verdict):
                 break
 
@@ -8229,6 +8206,8 @@ async def _async_call_llm_impl(
         extra_headers=None, api_mode=None, route_info=route_info,
     )
     client, kwargs, request_provider = req.client, req.kwargs, req.request_provider
+    from agent import auxiliary_retry_client
+    retry_route = auxiliary_retry_client.retry_cache_route(req, task, retry_kwargs["main_runtime"], True)
     _force_stream_async = _provider_requires_stream(request_provider, req.base_info or req.resolved_base_url)
 
     async def _acreate(_kwargs: dict[str, Any]) -> Any:
@@ -8248,10 +8227,11 @@ async def _async_call_llm_impl(
     if _should_retry_same_provider(task, failure, " (async)"):
         logger.info("Auxiliary %s (async): transient transport error; retrying "
                     "once on the same provider before fallback: %s", task or "call", failure.error)
+        client = auxiliary_retry_client.retry_route_client(req, retry_route)
         resp, exc = await _aoutcome(_primary())
         if exc is None:
             return resp
-        failure = _primary_failure(req, exc)
+        failure = _primary_failure(req, exc, client)
 
     async def _perform(step: _LadderStep) -> Any:
         kind, args, kw = _ladder_step_call(step, req, retry_kwargs, candidate_kwargs)

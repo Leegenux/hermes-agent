@@ -3450,21 +3450,32 @@ def _iter_httpx_pools_with_owner(http_client: Any):
     Walking the default transport alone makes ``force_close_tcp_sockets`` return 0 while a stream is still
     mid-recv — the interrupt logs success and the provider keeps burning the slot (#72975).
     """
-    seen_pools: set[int] = set()
+    seen_pools: set[tuple[int, int | None]] = set()
     try:
+        import httpcore
+        import httpx
+        from agent.process_bootstrap import _shared_transport_cls
+        from agent.usage_observer import SyncTransport
+
         transports = [getattr(http_client, "_transport", None)]
         transports += list((getattr(http_client, "_mounts", None) or {}).values())
         for transport in transports:
             if transport is None:
                 continue
-            # Connections live under ``_pool``; a directly mounted HTTPProxy *is* a ConnectionPool,
-            # so ``_connections`` may sit on the transport itself.
+            # Only the known observer is transparent. Unknown wrappers may expose
+            # a shared pool without its owner, so they must not be swept wholesale.
+            if type(transport) is SyncTransport:
+                transport = transport.inner
+            shared = type(transport) is _shared_transport_cls()
+            if not shared and type(transport) not in (httpx.HTTPTransport, httpcore.ConnectionPool, httpcore.HTTPProxy, httpcore.SOCKSProxy):
+                continue
             pool = getattr(transport, "_pool", None)
-            if pool is None and getattr(transport, "_connections", None) is not None:
+            if pool is None and isinstance(transport, httpcore.ConnectionPool):
                 pool = transport
-            if pool is not None and id(pool) not in seen_pools:
-                seen_pools.add(id(pool))
-                owner = id(transport) if type(transport).__name__ == "_SharedTransport" else None
+            owner = id(transport) if shared else None
+            identity = (id(pool), owner)
+            if pool is not None and identity not in seen_pools:
+                seen_pools.add(identity)
                 yield pool, owner
     except Exception:
         return

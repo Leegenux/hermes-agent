@@ -214,13 +214,15 @@ class TestTelegramApprovalCallback:
         adapter = _make_adapter()
         adapter._approval_state[5] = "agent:main:telegram:group:12345:99"
         adapter._approval_request_ids[5] = "req-5"
-        adapter.pause_typing_for_chat("12345")
-        assert "12345" in adapter._typing_paused
+        adapter.pause_typing_for_chat("12345", metadata={"thread_id": "99"})
+        adapter.pause_typing_for_chat("12345", metadata={"thread_id": "100"})
+        assert adapter.typing_is_paused("12345", {"thread_id": "99"})
 
         query = AsyncMock()
         query.data = "ea:once:5"
         query.message = MagicMock()
         query.message.chat_id = 12345
+        query.message.message_thread_id = 99
         query.from_user = MagicMock()
         query.from_user.first_name = "Norbert"
         query.from_user.id = "12345"
@@ -235,7 +237,8 @@ class TestTelegramApprovalCallback:
             with patch("tools.approval.resolve_gateway_approval", return_value=1):
                 await adapter._handle_callback_query(update, context)
 
-        assert "12345" not in adapter._typing_paused
+        assert not adapter.typing_is_paused("12345", {"thread_id": "99"})
+        assert adapter.typing_is_paused("12345", {"thread_id": "100"})
 
 
     @pytest.mark.asyncio

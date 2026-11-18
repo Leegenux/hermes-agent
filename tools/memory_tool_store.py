@@ -569,8 +569,8 @@ class MemoryStore:
     def resolve_batch_entries(self, target: str, operations: list[dict[str, Any]]) -> dict[str, Any]:
         """Dry-run ``apply_batch`` under the lock without persisting: the same content scan,
         op walk, empty-store and budget checks, so it fails exactly where the direct batch
-        would; on success ``{"success": True, "matched_entries": [...]}`` — per op, the FULL
-        entry its replace/remove selects now (None for add), in batch order."""
+        would; on success ``matched_entries`` gives each op's FULL selected entry
+        (None for add), and ``candidate_entries`` is the resulting preview, not a write."""
         return self._batch(target, operations, commit=False)
 
     def _batch(self, target: str, operations: list[dict[str, Any]], *, commit: bool) -> dict[str, Any]:
@@ -628,7 +628,7 @@ class MemoryStore:
                     f"removes or shortening patches of other stale entries to the same batch, then retry."),
                     "over_budget")
             if not commit:
-                return {"success": True, "matched_entries": matched}
+                return {"success": True, "matched_entries": matched, "candidate_entries": working}
             # op index -> full entry text its replace/remove selected (#117952), 1-based to
             # match the "Operation N" error numbering the model sees for failed ops.
             replaced, removed, patched = {}, {}, {}

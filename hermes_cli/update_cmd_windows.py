@@ -17,6 +17,7 @@ from pathlib import Path
 
 from agent.deadline import poll_until
 from hermes_cli.update_cmd_common import _best_effort
+from hermes_cli import update_local_patches as _local_patches
 
 logger = logging.getLogger("hermes_cli.update_cmd")  # log-record parity with the origin module
 
@@ -1595,6 +1596,8 @@ def _resume_unless_torn(token: dict) -> None:
             pause_record.sync(token)
             return
     try:
+        from hermes_cli.update_cmd import _m
+        _local_patches.verify_resume(_m().PROJECT_ROOT)
         _resume_paused_set(token)
     finally:
         pause_record.sync(token)

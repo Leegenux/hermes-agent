@@ -587,7 +587,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         _pause_typing_before_finalize = None
         if source.platform == Platform.TELEGRAM and hasattr(adapter, "pause_typing_for_chat"):
             def _pause_typing_before_finalize(_adapter=adapter, _chat_id=source.chat_id) -> None:
-                _adapter.pause_typing_for_chat(_chat_id)
+                from gateway.platforms.typing_scope import set_typing_paused
+                set_typing_paused(_adapter, _chat_id, paused=True, metadata={"thread_id": source.thread_id})
         # Non-editing platforms (QQ, WeChat) skip streaming — the partial first message could never
         # be updated — unless they have a native-streaming transport (WeCom msgtype "stream").
         _adapter_supports_edit = getattr(adapter, "SUPPORTS_MESSAGE_EDITING", True)
@@ -860,9 +861,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         if policy:
             enabled_toolsets = policy_turn_toolsets(active_authority(self), policy, user_config, source.chat_id)
         adapter = self._delivery_adapter_for(source)
-        # Tool preview length (0 = no limit) and friendly tool labels (default on), per-platform.
+        # Tool preview length: None = not configured, 0 = no limit (per-platform).
         for _setter, _setting, _default, _cast in (
-            ("set_tool_preview_max_len", "tool_preview_length", 0, lambda v: int(v) if v else 0),
+            ("set_tool_preview_max_len", "tool_preview_length", None, lambda v: None if v is None else int(v)),
             ("set_friendly_tool_labels", "friendly_tool_labels", True, bool),
         ):
             with suppress(Exception):
@@ -1136,6 +1137,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
 
         Created on the gateway loop thread (not run_sync's executor); an inactive consumer leaves
         the holder None so the whole-file fallback path runs."""
+        from gateway.completion_report_scope import completion_scope
+        if completion_scope.get() is not None:
+            return
         # Skip when streaming TTS already delivered audio for this turn (#60671).
         # This avoids a cross-scope NameError: the outer interrupt / finalisation paths reference the
         # consumer via ``streaming_tts_consumer_holder[0]``. Gates: voice input, auto-TTS enabled for this
@@ -1777,6 +1781,8 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         # Restart the typing indicator; the outer typing task may be stale.
         if _clear_adapter:
             with suppress(Exception):
+                from gateway.platforms.typing_scope import set_typing_paused
+                set_typing_paused(_clear_adapter, source.chat_id, paused=False, metadata=_status_thread_metadata)
                 await _clear_adapter.send_typing(source.chat_id, metadata=typing_metadata_for_turn(
                     _clear_adapter, source.chat_id, next_message_id, _status_thread_metadata))
 

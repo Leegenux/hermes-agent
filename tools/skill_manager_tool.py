@@ -47,7 +47,7 @@ def _guard_agent_created_enabled() -> bool:
         return False
 
 
-def _security_scan_skill(skill_dir: Path) -> Optional[str]:
+def _security_scan_skill(skill_dir: Path, *, fail_closed: bool = False) -> Optional[str]:
     """Post-write scan (opt-in); error string if blocked, else None. An "ask" verdict
     (dangerous findings) is surfaced as an error so the agent can retry without them."""
     if not _guard_agent_created_enabled():
@@ -61,6 +61,8 @@ def _security_scan_skill(skill_dir: Path) -> Optional[str]:
             return f"Security scan blocked this skill ({reason}):\n{format_scan_report(result)}"
     except Exception as e:
         logger.warning("Security scan failed for %s: %s", skill_dir, e, exc_info=True)
+        if fail_closed:
+            return "Configured skill security scanner unavailable; capacity installation refused."
     return None
 
 
@@ -266,6 +268,9 @@ def _find_skill(name: str) -> Optional[dict[str, Any]]:
     nothing: like skill_view's same-tier collision refusal, refusing to guess beats
     silently mutating the wrong skill; the directory name still resolves."""
     from agent.skill_utils import get_all_skills_dirs
+    from agent.background_review_capacity_sources import find_scoped_capacity_skill
+    if capacity_skill := find_scoped_capacity_skill(name):
+        return capacity_skill
     local_root = None
     if "/" in name or "\\" in name:
         try:
@@ -690,6 +695,10 @@ def _run_write_gate(build_staging):
 
 def _apply_skill_write_gate(action, name, **payload_kwargs):
     """Flat-shape gate: stage the full kwargs so approval can replay them; bypassed during replay."""
+    from agent.background_review_capacity_skill_drafts import stage_skill_capacity
+    capacity = stage_skill_capacity({'action': action, 'name': name, **payload_kwargs})
+    if capacity is not None:
+        return capacity
     if action not in _ACTION_HANDLERS or _skill_gate_bypass.get():
         return None
     def _staging(wa):
@@ -715,6 +724,9 @@ def _skill_manage_from(payload: dict[str, Any], **extra) -> str:
 
 def apply_skill_pending(payload: dict[str, Any]) -> str:
     """Replay a staged skill write, bypassing the gate (the /skills approve handler)."""
+    if payload.get('_native_capacity_draft'):
+        return json.dumps({'success': False, 'error':
+                           'Unreviewed capacity draft cannot use ordinary skill approval.'})
     token = _skill_gate_bypass.set(True)
     try:
         return _skill_manage_from(payload)

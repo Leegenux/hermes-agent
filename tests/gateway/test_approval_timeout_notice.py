@@ -10,7 +10,8 @@ from gateway import run_turn_runner_approval_settle as settle_mod
 class _Runner:
     def __init__(self, *, current: bool):
         self.scheduled = []
-        self._ctx = SimpleNamespace(session_key="telegram:1", _run_still_current=lambda: current)
+        self._ctx = SimpleNamespace(session_key="telegram:1", _run_still_current=lambda: current,
+                                    _status_adapter=None)
 
     def _schedule(self, coro, label):
         coro.close()

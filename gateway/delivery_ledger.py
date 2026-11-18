@@ -30,7 +30,8 @@ _DB_LOCK = threading.Lock()
 
 # Redelivery policy knobs (deliberately not config — the ledger is gated by
 # ``gateway.delivery_ledger`` and these only matter in the rare recovery path).
-MAX_ATTEMPTS = 3
+MAX_ATTEMPTS = 20
+RETRY_WINDOW_SECONDS = 30 * 60
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
@@ -55,9 +56,8 @@ FLOOD_MARKER = ("♻️ Recovered reply — the messaging platform's rate limit 
 # with the attempts already spent, so a platform-side outage is not hammered by the redelivery timer.
 # A whole-chat death (blocked bot, deleted group, deactivated user) is never retried: the target is gone.
 _RUNTIME_RETRYABLE_ERRORS = frozenset({"send_path_degraded"})
-# One tier per in-process retry; the last budgeted attempt is left to the boot sweep (retry_not_before).
+# Short initial backoff, then a capped wait; recovery never requires a process restart.
 _RETRY_BACKOFF_SECONDS = (30.0, 120.0)
-assert len(_RETRY_BACKOFF_SECONDS) == MAX_ATTEMPTS - 1
 
 # A final send the platform refused with flood control is the other transient case: a 429 means the
 # refused request was never accepted, and the platform said how long to wait. Adapters fail such sends
@@ -151,10 +151,11 @@ def flood_not_before(updated_at: Any, last_error: Any) -> float:
 def retry_not_before(updated_at: Any, last_error: Any, attempts: Any) -> Optional[float]:
     """Earliest moment a failed row may be resent, or ``None`` for a row the runtime must leave alone:
     a flood refusal keeps the platform's own wait, an allowlisted reconnect error is due at once, a
-    whole-chat death is final, and any other rejection backs off by the attempts already spent — but
-    never spends the LAST budgeted attempt. An unclassified outage can outlast any timer, and a row
-    the timer abandoned would be lost for good; leaving one attempt keeps it recoverable by the boot
-    sweep after a restart, which is a real recovery signal."""
+    whole-chat death is final, and any other rejection backs off by the attempts already spent.
+    One attempt remains reserved for boot recovery; runtime sweeps separately bound reply age."""
+    spent = int(attempts or 0)
+    if spent >= MAX_ATTEMPTS - 1:
+        return None
     if is_flood_error(last_error):
         return flood_not_before(updated_at, last_error)
     text = str(last_error or "").strip().lower()
@@ -162,10 +163,13 @@ def retry_not_before(updated_at: Any, last_error: Any, attempts: Any) -> Optiona
         return _failed_stamp(updated_at)
     if classify_dead_error(text):
         return None
-    spent = int(attempts or 0)
-    if spent >= MAX_ATTEMPTS - 1:
-        return None
-    return _failed_stamp(updated_at) + _RETRY_BACKOFF_SECONDS[spent]
+    return _failed_stamp(updated_at) + _RETRY_BACKOFF_SECONDS[min(spent, len(_RETRY_BACKOFF_SECONDS) - 1)]
+
+
+def _retry_expired(created_at: float, last_error: Any, now: float) -> bool:
+    """Bound ordinary replay age without discarding a platform's longer flood-control wait."""
+    window = STALE_AFTER_SECONDS if is_flood_error(last_error) else RETRY_WINDOW_SECONDS
+    return now - created_at > window
 
 
 def _db_path():
@@ -268,7 +272,8 @@ def compute_obligation_id(session_key: str, message_ref: str, content: str) -> s
 
 
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
-                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None) -> None:
+                      thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
+                      _bind_on_conn=None) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
@@ -280,6 +285,8 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
                VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default"))
+        if _bind_on_conn is not None:
+            _bind_on_conn(conn)
         # Same transaction, same connection: the cron ledgers prune this way too
         # (cron/delivery_queue._prune_terminal_unlocked, cron/executions._prune_unlocked).
         _prune_unlocked(conn, now)
@@ -305,6 +312,18 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, str(adapter_profile).strip() if adapter_profile else "default",
              session_key, content, since))
+
+
+def report_dispatch_allowed(obligation_id: str) -> bool:
+    """Ordinary replies are unchanged; stopped reports must not be recovered later."""
+    from gateway.completion_report_delivery import report_dispatch_allowed_on_conn
+    with _DB_LOCK, _transaction() as conn:
+        if report_dispatch_allowed_on_conn(conn, obligation_id):
+            return True
+        conn.execute("UPDATE delivery_obligations SET state='abandoned',updated_at=?,last_error=? "
+                     "WHERE obligation_id=? AND state!='delivered'",
+                     (time.time(), 'report stopped or no longer dispatchable', obligation_id))
+        return False
 
 
 def mark_attempting(obligation_id: str) -> None:
@@ -347,6 +366,9 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
                SET state=?, updated_at=?, last_error=?
                WHERE obligation_id=?""",
             (state, time.time(), error[:500] if error else None, obligation_id))
+        if state == 'delivered':
+            from gateway.completion_report_delivery import confirm_reports_for_delivery_on_conn
+            confirm_reports_for_delivery_on_conn(conn, obligation_id)
 
 
 def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,
@@ -475,8 +497,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
             # Exact process-start matching prevents PID reuse from stealing work.
             if adapter_profile != expected_profile or owner_pid != pid or owner_started_at != started:
                 continue
-            due = retry_not_before(updated_at, last_error, attempts)
-            if due is None:
+            if classify_dead_error(last_error):
                 continue
             owner_guard = (now, oid, owner_pid, owner_started_at)
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
@@ -485,6 +506,9 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                        SET state='abandoned', updated_at=?
                        WHERE obligation_id=? AND state='failed'
                          AND owner_pid IS ? AND owner_started_at IS ?""", owner_guard)
+                continue
+            due = retry_not_before(updated_at, last_error, attempts)
+            if due is None or _retry_expired(created_at, last_error, now):
                 continue
             if now < due:
                 continue  # the platform's wait or the backoff has not passed; the timer comes back for it
@@ -525,7 +549,7 @@ def pending_retries(now: Optional[float] = None) -> list[dict[str, Any]]:
         if is_reconnect_only(last_error):
             continue
         due = retry_not_before(updated_at, last_error, attempts)
-        if due is None or attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
+        if due is None or attempts >= MAX_ATTEMPTS or _retry_expired(created_at, last_error, now):
             continue
         key = (platform, adapter_profile or "default")
         if key not in earliest or due < earliest[key]:

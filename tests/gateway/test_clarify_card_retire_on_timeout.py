@@ -101,6 +101,13 @@ def test_timeout_retires_the_native_card_with_the_expired_notice():
     assert "expired" in adapter.retired[0][1].lower()
 
 
+def test_timeout_resumes_the_agent_typing_lifecycle():
+    adapter = _CardAdapter()
+    reply, _ = _run_clarify(adapter)
+    assert reply['outcome'] == 'timed_out'
+    assert adapter.resumed == 1
+
+
 def test_timeout_schedules_nothing_for_adapters_without_a_card():
     _response, labels = _run_clarify(_TextAdapter())
     assert labels == ["Clarify send failed to schedule"]
@@ -126,10 +133,10 @@ _THREE_QUESTIONS = [{"qid": f"q{i}", "question": q, "choices": ["a", "b"], "mult
 @pytest.mark.parametrize("answers,asked,payload,resumed", [
     # Nobody answers question 1: the batch ends there instead of re-asking — every further
     # question used to cost another full clarify_timeout — and reports the walk-away.
-    ((), ["One?"], {"answers": {}, "outcome": "timed_out", "notice": "[user did not respond within 0m]"}, 0),
+    ((), ["One?"], {"answers": {}, "outcome": "timed_out", "notice": "[user did not respond within 0m]"}, 1),
     # Answers already given survive; the unanswered question is not invented.
     (("use postgres",), ["One?", "Two?"],
-     {"answers": {"q0": "use postgres"}, "outcome": "timed_out", "notice": "[user did not respond within 0m]"}, 0),
+     {"answers": {"q0": "use postgres"}, "outcome": "timed_out", "notice": "[user did not respond within 0m]"}, 1),
     # A fully answered batch re-arms typing once, at the end: between two cards the re-arm
     # would only open a bubble the next question's boundary finalizes.
     (("one", "two", "three"), ["One?", "Two?", "Three?"],

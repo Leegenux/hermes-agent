@@ -18,10 +18,13 @@ import time
 import uuid
 import weakref
 from abc import ABC, abstractmethod
+from gateway.platforms.typing_scope import TypingPauseMixin, set_typing_paused, typing_scope
 from hermes_dir_acl import make_user_dir, unusable_dir_remedy
 from gateway.platforms.base_log_safety import describe_proxy_error, env_proxy_for_redaction, safe_proxy_url_for_log, safe_url_for_log
 from gateway.platforms.base_image_sniff import _looks_like_image
 from gateway.platforms.base_media_flags import pad_inline_flags
+from gateway.platforms.base_media_notes import media_failure_text, stage_media_failure_note
+from gateway.platforms.base_media_names import capped_document_name, safe_cache_extension
 
 from utils import normalize_proxy_url, unlink_files_older_than
 from agent.i18n import t
@@ -180,17 +183,6 @@ def _reply_anchor_for_event(event) -> str | None:
     if platform == "feishu" and thread_id and getattr(event, "reply_to_message_id", None):
         return getattr(event, "reply_to_message_id", None)
     return getattr(event, "message_id", None)
-
-
-_MEDIA_KIND_KEYS = frozenset({"audio", "video", "file", "image"})
-
-
-def _media_failure_text(kind: str, file_name: str | None = None) -> str:
-    """User-facing "couldn't deliver" notice; ``file_name`` is the only name ever shown."""
-    kind_label = t(f"gateway.notify.media_kind.{kind}") if kind in _MEDIA_KIND_KEYS else kind
-    if file_name:
-        return t("gateway.notify.media_delivery_failed_with_name", kind=kind_label, file_name=file_name)
-    return t("gateway.notify.media_delivery_failed", kind=kind_label)
 
 
 def should_send_media_as_audio(platform, ext: str, is_voice: bool = False) -> bool:
@@ -610,7 +602,8 @@ def _write_cache_file(cache_dir: Path, prefix: str, ext: str, data: bytes) -> st
     platforms where POSIX mode bits are advisory (Windows): falls back to a
     plain write rather than failing the media write.
     """
-    filepath = cache_dir / f"{prefix}_{uuid.uuid4().hex[:12]}{ext}"
+    # ``ext`` is caller-supplied; safe_cache_extension keeps it a bare `.suffix`, so it cannot escape.
+    filepath = cache_dir / f"{prefix}_{uuid.uuid4().hex[:12]}{safe_cache_extension(ext)}"
     try:
         fd = os.open(str(filepath), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     except OSError:
@@ -1418,11 +1411,8 @@ def cache_document_from_bytes(data: bytes, filename: str) -> str:
     """Save raw document bytes to the cache as ``doc_{uuid12}_{original_name}`` and return
     the absolute path; raises ValueError if the sanitized path escapes the cache directory."""
     cache_dir = get_document_cache_dir()
-    # Sanitize: strip directory components, null bytes, and control characters
-    safe_name = (Path(filename).name if filename else "document").replace("\x00", "").strip()
-    if not safe_name or safe_name in {".", ".."}:
-        safe_name = "document"
-    filepath = cache_dir / f"doc_{uuid.uuid4().hex[:12]}_{safe_name}"
+    # One component, bounded length, openable on Windows; the whys live in base_media_names.
+    filepath = cache_dir / f"doc_{uuid.uuid4().hex[:12]}_{capped_document_name(filename)}"
     # Final safety check: ensure path stays inside cache dir
     if not filepath.resolve().is_relative_to(cache_dir.resolve()):
         raise ValueError(f"Path traversal rejected: {filename!r}")
@@ -1690,10 +1680,12 @@ class EphemeralReply(str):
 
 
 def merge_pending_message_event(pending_messages: dict[str, MessageEvent], session_key: str,
-                                event: MessageEvent, *, merge_text: bool = False) -> None:
+                                event: MessageEvent, *, merge_text: bool = False,
+                                adapter_slot: bool = False) -> None:
     """Store or merge a pending event: photo bursts/albums merge into the queued event so the next
     turn sees the whole burst; with ``merge_text`` rapid TEXT follow-ups append instead of
     replace."""
+    from gateway.pending_trace import trace
     existing = pending_messages.get(session_key)
     if existing:
         existing_type = getattr(existing, "message_type", None)
@@ -1724,14 +1716,18 @@ def merge_pending_message_event(pending_messages: dict[str, MessageEvent], sessi
             for attr in ("_gateway_pending_stt_text", "_gateway_pending_stt_transcripts"):
                 if hasattr(existing, attr):
                     delattr(existing, attr)
+            trace('adapter_slot_merge' if adapter_slot else 'generic_pending_merge', session_key, event, producer='base.merge')
             return
         both_text = existing_type == MessageType.TEXT and event.message_type == MessageType.TEXT
         if merge_text and both_text:
             if event.text:
                 existing.text = _append_text(existing.text, event.text)
             existing.absorb_turn_input(event)
+            trace('adapter_slot_merge' if adapter_slot else 'generic_pending_merge', session_key, event, producer='base.merge')
             return
     pending_messages[session_key] = event
+    trace(('adapter_slot_replace' if existing else 'adapter_slot_set') if adapter_slot else
+          ('generic_pending_replace' if existing else 'generic_pending_set'), session_key, event, producer='base.merge')
 
 
 # Transient *connection* failures worth retrying. Plain/read/write "timeout" excluded on purpose:
@@ -1799,7 +1795,7 @@ def _lazy_attr(obj: Any, name: str, factory: Callable[[], Any]) -> Any:
 _strip_media_directives = _strip_media_tag_directives
 
 
-class BasePlatformAdapter(ABC):
+class BasePlatformAdapter(TypingPauseMixin, ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
@@ -1997,7 +1993,7 @@ class BasePlatformAdapter(ABC):
     def format_tool_event(self, event: Any, *, mode: str = "all", preview_max_len: int = 40) -> Optional[str]:
         """Rendered chrome for a ToolCallChunk, or None to eat it (adapters without editing/rich
         text override to None). ``mode``: tool-progress mode ("all"/"new"/"verbose");
-        ``preview_max_len`` mirrors ``tool_preview_length`` (0 = no cap in verbose)."""
+        ``preview_max_len`` mirrors ``tool_preview_length`` (0 = no cap)."""
         from gateway.stream_events import ToolCallChunk
         if not isinstance(event, ToolCallChunk):
             return None
@@ -2011,9 +2007,9 @@ class BasePlatformAdapter(ABC):
         if mode == "verbose":
             return t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=event.preview)
         # "all" / "new": short capped preview (default 40; progress bubbles persist as messages).
-        cap = preview_max_len if preview_max_len > 0 else 40
+        # 0 = no cap, the documented meaning of tool_preview_length: 0 (never coerce it to 40).
         prepared = prepare_tool_preview(
-            event.tool_name, event.args, fallback=event.preview, max_len=cap)
+            event.tool_name, event.args, fallback=event.preview, max_len=preview_max_len)
         return t("gateway.progress.tool_preview", emoji=emoji, tool=tool, preview=self.format_tool_preview(prepared))
 
 
@@ -2974,7 +2970,7 @@ class BasePlatformAdapter(ABC):
         logged but NEVER echoed into chat (host layout leak); only the caller's ``file_name`` is
         shown."""
         logger.warning("[%s] %s fallback: native %s send unavailable for %s", self.name, method, kind, path)
-        text = _media_failure_text(kind, file_name)
+        text = media_failure_text(kind, file_name)
         return await self.emit_media_warning(chat_id, text, caption=caption, reply_to=reply_to, metadata=metadata,
                                              shown_metadata=metadata)
 
@@ -3108,11 +3104,11 @@ class BasePlatformAdapter(ABC):
         """
         ext = Path(media_path).suffix.lower()
         if is_voice or should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-            text = _media_failure_text("audio")
+            text = media_failure_text("audio")
         elif ext in _VIDEO_EXTS:
-            text = _media_failure_text("video")
+            text = media_failure_text("video")
         else:
-            text = _media_failure_text("file", os.path.basename(media_path))
+            text = media_failure_text("file", os.path.basename(media_path))
         try:
             notice = await self.emit_warning(chat_id, text, metadata=metadata)
             problem = None if notice is None or notice.success else notice.error
@@ -3279,12 +3275,15 @@ class BasePlatformAdapter(ABC):
         state expires after ~5s). Chats in ``_typing_paused`` are skipped (approval waits — Slack's
         setStatus disables the compose box). Each ``send_typing`` is bounded by a sub-interval
         timeout so one slow round-trip is abandoned before the next tick, not the bubble lapsing."""
+        scope = typing_scope(self.platform, chat_id, metadata)
         _send_typing_timeout = max(0.25, min(1.5, interval - 0.25))
+        # Fast local admission checks need not shrink the real HTTP round-trip budget.
+        _send_typing_timeout = getattr(self, 'TYPING_SEND_TIMEOUT_SECONDS', _send_typing_timeout)
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
                     return
-                if chat_id not in self._typing_paused:
+                if not self.typing_is_paused(chat_id, metadata):
                     try:
                         await asyncio.wait_for(self.send_typing(chat_id, metadata=metadata),
                                                timeout=_send_typing_timeout)
@@ -3309,7 +3308,7 @@ class BasePlatformAdapter(ABC):
         finally:
             # A send_typing after an outer stop_typing() may have recreated the platform loop.
             await self._stop_typing_quietly(chat_id, metadata)
-            self._typing_paused.discard(chat_id)
+            self._typing_paused.discard(scope)
             # getattr-guard: tests build adapters via object.__new__ without _status_text.
             getattr(self, "_status_text", {}).pop(str(chat_id), None)
 
@@ -3317,7 +3316,8 @@ class BasePlatformAdapter(ABC):
         self, chat_id: str, typing_task: asyncio.Task | None = None, *, metadata=None,
         timeout: float = 0.5, stop_attempts: int = 2) -> None:
         """Stop the refresh task and platform typing state as one operation."""
-        self._typing_paused.add(chat_id)
+        scope = typing_scope(self.platform, chat_id, metadata)
+        self._typing_paused.add(scope)
         try:
             if typing_task is not None and not typing_task.done():
                 typing_task.cancel()
@@ -3329,20 +3329,13 @@ class BasePlatformAdapter(ABC):
                     await asyncio.sleep(0)
                 await self._stop_typing_quietly(chat_id, metadata)
         finally:
-            self._typing_paused.discard(chat_id)
+            self._typing_paused.discard(scope)
 
     async def _stop_typing_quietly(self, chat_id: str, metadata=None) -> None:
         """Best-effort platform stop_typing; adapter errors are swallowed."""
         with contextlib.suppress(Exception):
             await self._stop_typing_with_metadata(chat_id, metadata)
 
-    def pause_typing_for_chat(self, chat_id: str) -> None:
-        """Pause typing for a chat (approval waits); GIL-safe from the sync agent thread."""
-        self._typing_paused.add(chat_id)
-
-    def resume_typing_for_chat(self, chat_id: str) -> None:
-        """Resume typing indicator for a chat after approval resolves."""
-        self._typing_paused.discard(chat_id)
 
     async def interrupt_session_activity(self, session_key: str, chat_id: str, metadata=None) -> None:
         """Signal the active session loop to stop and clear typing immediately."""
@@ -3522,7 +3515,7 @@ class BasePlatformAdapter(ABC):
     @records_delivery
     async def _send_with_retry(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Any = None,
-        max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
+        max_retries: int = 2, base_delay: float = 2.0, *, require_complete_text: bool = False) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
         async def _send(text: str) -> SendResult:
@@ -3636,6 +3629,11 @@ class BasePlatformAdapter(ABC):
             # Part of a split payload is already on screen; a plain-text re-send of the whole would duplicate it.
             logger.warning("[%s] Send failed after partial delivery: %s — not re-sending as plain text", self.name, error_str)
             return result
+        if require_complete_text:
+            # Platform fallback can truncate (e.g. content[:3500]). A report's
+            # durable ACK covers the full prepared text, never that shorter body.
+            logger.warning("[%s] Complete report send failed; refusing lossy fallback: %s", self.name, error_str)
+            return result
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self._send_plain_fallback(chat_id, content, reply_to=reply_to, metadata=metadata)
         if not fallback_result.success:
@@ -3735,7 +3733,7 @@ class BasePlatformAdapter(ABC):
             if state is not None and not self._can_merge_text_debounce_events(state.event, event):
                 existing_pending = self._pending_messages.get(session_key)
                 if existing_pending is not None and self._can_merge_text_debounce_events(existing_pending, event):
-                    merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True)
+                    merge_pending_message_event(self._pending_messages, session_key, event, merge_text=True, adapter_slot=True)
                 return
         now = time.monotonic()
         if state is None:
@@ -3781,7 +3779,7 @@ class BasePlatformAdapter(ABC):
         if pending is not None and not self._can_merge_text_debounce_events(pending, state.event):
             return False
         store.pop(session_key, None)
-        merge_pending_message_event(self._pending_messages, session_key, state.event, merge_text=True)
+        merge_pending_message_event(self._pending_messages, session_key, state.event, merge_text=True, adapter_slot=True)
         return True
 
     def _discard_text_debounce(self, session_key: str) -> None:
@@ -3817,7 +3815,10 @@ class BasePlatformAdapter(ABC):
         logger.warning("[%s] Healing stale session lock for %s (owner task is done/absent)",
                        self.name, session_key)
         self._active_sessions.pop(session_key, None)
-        self._pending_messages.pop(session_key, None)
+        pending = self._pending_messages.pop(session_key, None)
+        if pending is not None:
+            from gateway.pending_trace import trace
+            trace('adapter_stale_discard', session_key, pending, producer='base.stale_heal')
         self._requeue_counts.pop(session_key, None)
         self._session_tasks.pop(session_key, None)
         self._discard_text_debounce(session_key)
@@ -3830,11 +3831,23 @@ class BasePlatformAdapter(ABC):
         (False)."""
         guard = interrupt_event or asyncio.Event()
         self._active_sessions[session_key] = guard
-        task = asyncio.create_task(self._process_message_background(event, session_key))
+        from gateway.session_authority import _arrival_epoch, capture_arrival_epoch
+        arrival = capture_arrival_epoch(self.gateway_runner, event.source, session_key)
+        from gateway.session_startup_owner import attach
+        owner = attach(self.gateway_runner, event, session_key)
+        token = _arrival_epoch.set(arrival)
+        try:
+            task = asyncio.create_task(self._process_message_background(event, session_key))
+        finally:
+            _arrival_epoch.reset(token)
         if not self._track_session_task(session_key, task):
+            if owner is not None:
+                owner.finish()
             self._session_tasks.pop(session_key, None)
             self._release_session_guard(session_key, guard=guard)
             return False
+        if owner is not None:
+            task.add_done_callback(lambda _task: owner.finish())
         return True
 
     def _track_session_task(self, session_key: str, task: Any) -> bool:
@@ -3874,7 +3887,10 @@ class BasePlatformAdapter(ABC):
                 logger.debug("[%s] Session cancellation raised while unwinding %s", self.name,
                              session_key, exc_info=True)
         if discard_pending:
-            self._pending_messages.pop(session_key, None)
+            pending = self._pending_messages.pop(session_key, None)
+            if pending is not None:
+                from gateway.pending_trace import trace
+                trace('adapter_cancel_discard', session_key, pending, producer='base.cancel')
             self._discard_text_debounce(session_key)
         if release_guard:
             self._release_session_guard(session_key)
@@ -3885,6 +3901,9 @@ class BasePlatformAdapter(ABC):
         spawn a fresh processing task for any follow-up queued meanwhile."""
         await self._flush_text_debounce_now(session_key)
         pending_event = self._pending_messages.pop(session_key, None)
+        if pending_event is not None:
+            from gateway.pending_trace import trace
+            trace('adapter_command_drain', session_key, pending_event, producer='base.command_drain')
         self._release_session_guard(session_key, guard=command_guard)
         if pending_event is not None:
             self._start_session_processing(pending_event, session_key)
@@ -4063,7 +4082,7 @@ class BasePlatformAdapter(ABC):
         # Photo bursts/albums: queue without interrupting; they run after the current task.
         if event.message_type == MessageType.PHOTO:
             logger.debug("[%s] Queuing photo follow-up for session %s without interrupt", self.name, session_key)
-            merge_pending_message_event(self._pending_messages, session_key, event)
+            merge_pending_message_event(self._pending_messages, session_key, event, adapter_slot=True)
             event._gateway_accepted = True
             return
         if self._is_queue_text_debounce_candidate(event):
@@ -4075,7 +4094,7 @@ class BasePlatformAdapter(ABC):
             logger.debug("[%s] New message while session %s is active — queuing follow-up "
                          "(no interrupt, will cascade after current turn)", self.name, session_key)
             merge_pending_message_event(self._pending_messages, session_key, event,
-                                        merge_text=event.message_type == MessageType.TEXT)
+                                        merge_text=event.message_type == MessageType.TEXT, adapter_slot=True)
             event._gateway_accepted = True
 
     def _get_human_delay(self) -> float:
@@ -4155,16 +4174,28 @@ class BasePlatformAdapter(ABC):
                 _ledger_id = getattr(event, "message_id", "")
             obligation_id = compute_obligation_id(
                 session_key, str(_ledger_id or ""), text_content)
+            bind_options = {}
+            report_delivery = getattr(event, '_completion_report_delivery', None)
+            if report_delivery is not None:
+                from gateway.completion_report_delivery import bind_report_delivery
+                authority = report_delivery['authority']
+                def bind(conn):
+                    return bind_report_delivery(authority.db, epoch=authority.epoch,
+                        admission_id=report_delivery['admission_id'], report_ids=report_delivery['report_ids'],
+                        obligation_id=obligation_id, response=text_content, _conn=conn)
+                bind_options['_bind_on_conn'] = bind
             await asyncio.to_thread(
                 record_obligation, obligation_id=obligation_id, session_key=session_key,
                 platform=str(getattr(source.platform, "value", source.platform)),
                 chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
                 content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
+                adapter_profile=getattr(delivery_adapter, "_owner_profile", None), **bind_options)
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:
             logger.debug("delivery ledger record failed", exc_info=True)
+            if getattr(event, '_completion_report_delivery', None) is not None:
+                raise  # tracked reports require a durable, atomically bound row
             return None
 
     async def _finalize_delivery_obligation(
@@ -4190,6 +4221,10 @@ class BasePlatformAdapter(ABC):
                 if live is not delivery_adapter and callable(redeliver):
                     await redeliver(event.source.platform,
                                     profile=getattr(delivery_adapter, "_owner_profile", None))
+                elif live is delivery_adapter:
+                    schedule = getattr(self.gateway_runner, "_schedule_send_path_recovery", None)
+                    if callable(schedule):
+                        schedule(delivery_adapter, reason="failed-finalized")
             elif classify_dead_error(error) is None:  # a dead chat is never retried: no timer to wake
                 schedule = getattr(self.gateway_runner, "_schedule_flood_redelivery", None)
                 if callable(schedule):
@@ -4232,6 +4267,7 @@ class BasePlatformAdapter(ABC):
             if not result.success:
                 logger.warning("[%s] Failed to send %s (%s): %s", self.name,
                                "media" if media_tag else "local file", ext, result.error)
+                stage_media_failure_note(self, event, path, result)
                 if not (isinstance(result.raw_response, dict) and result.raw_response.get("failure_notice_sent")):
                     await self._notify_media_delivery_failure(chat_id, path, is_voice=is_voice, metadata=metadata)
             return result
@@ -4265,6 +4301,13 @@ class BasePlatformAdapter(ABC):
             record_delivery(SendResult(success=False, error=str(batch_err)))
             return
         record_delivery(result)
+        if not getattr(result, "success", False):
+            from urllib.request import url2pathname
+            paths = [(url2pathname(u[7:]) if u.startswith("file://") else u) for u, _alt in images]
+            for path in paths:
+                stage_media_failure_note(self, event, path, result)
+            await self._notify_media_delivery_failure(
+                event.source.chat_id, paths[0] if paths else "", metadata=metadata)
 
     async def send_final_ledgered(
         self, event: MessageEvent, session_key: str, text_content: str, metadata: dict[str, Any], *,
@@ -4282,10 +4325,14 @@ class BasePlatformAdapter(ABC):
                     len(text_content), event.source.chat_id)
         obligation_id = await self._record_delivery_obligation(
             event, session_key, text_content, delivery_adapter, is_ephemeral_response)
+        report_delivery = getattr(event, '_completion_report_delivery', None)
+        if report_delivery is not None and obligation_id is None:
+            raise RuntimeError('report delivery binding failure: durable binding unavailable')
         if obligation_id is not None:
             await self._release_turn_marker(event)  # the ledger now owns the crash recovery
         result = await delivery_adapter._send_with_retry(
-            chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+            chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata,
+            **({'require_complete_text': True} if report_delivery is not None else {}))
         stop_reply_clock(delivery_adapter, event.source.chat_id, result)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
@@ -4429,6 +4476,9 @@ class BasePlatformAdapter(ABC):
         drain task and leave it the guard. Nothing pending: release the guard only if we still own
         it."""
         late_pending = self._pending_messages.pop(session_key, None)
+        if late_pending is not None:
+            from gateway.pending_trace import trace
+            trace('adapter_finish_pop', session_key, late_pending, producer='base.finish')
         current_task = asyncio.current_task()
         if late_pending is not None:
             existing_task = self._session_tasks.get(session_key)
@@ -4439,6 +4489,8 @@ class BasePlatformAdapter(ABC):
                 # follow-up: prevents the create_task path from racing with itself across the
                 # in-band/finally boundary).
                 self._pending_messages[session_key] = late_pending
+                from gateway.pending_trace import trace
+                trace('pending_restore', session_key, late_pending, producer='base.finish')
             else:
                 logger.debug(
                     "[%s] Late-arrival pending message during cleanup — spawning drain task",
@@ -4516,7 +4568,7 @@ class BasePlatformAdapter(ABC):
                 # measured to have no effect).
                 if text_content or extracted.images or extracted.media_files or extracted.local_files \
                         or _tts_paths or _tts_caption_delivered:
-                    self.pause_typing_for_chat(event.source.chat_id)
+                    set_typing_paused(self, event.source.chat_id, paused=True, metadata=_typing_metadata)
                 if text_content and not _tts_caption_delivered:
                     await self._send_final_text(
                         event, session_key, text_content, _final_thread_metadata,
@@ -4542,6 +4594,8 @@ class BasePlatformAdapter(ABC):
                 delay = self._requeue_backoff_delay(session_key, pending_event, event)
                 if not delay:  # a backed-off event stays queued until the drain task wakes
                     self._pending_messages.pop(session_key)
+                from gateway.pending_trace import trace
+                trace('adapter_drain_deferred' if delay else 'adapter_drain', session_key, pending_event, generation=getattr(interrupt_event, '_hermes_run_generation', None), producer='base.process')
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 self._clear_session_guard(session_key)
                 await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata)
@@ -4629,6 +4683,9 @@ class BasePlatformAdapter(ABC):
             await asyncio.sleep(delay)
             await self._flush_text_debounce_now(session_key)  # as every other task exit does
             pending_event = self._pending_messages.pop(session_key, None)
+            if pending_event is not None:
+                from gateway.pending_trace import trace
+                trace('adapter_delayed_drain_pop', session_key, pending_event, producer='base.delayed_drain')
             if pending_event is None:  # consumed elsewhere during the back-off
                 self._cleanup_finished_session_task(session_key, guard)
                 return
@@ -4685,6 +4742,9 @@ class BasePlatformAdapter(ABC):
             flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
         for state in self._text_debounce_store().values():
             state.cancel_timer()
+        from gateway.pending_trace import trace
+        for session_key, event in self._pending_messages.items():
+            trace('adapter_shutdown_clear', session_key, event, producer='base.shutdown')
         for bucket in (self._background_tasks, self._expected_cancelled_tasks, self._session_tasks,
                        self._pending_messages, self._active_sessions, self._requeue_counts,
                        self._text_debounce_store()):
@@ -4696,7 +4756,11 @@ class BasePlatformAdapter(ABC):
 
     def get_pending_message(self, session_key: str) -> Optional[MessageEvent]:
         """Get and clear any pending message for a session."""
-        return self._pending_messages.pop(session_key, None)
+        event = self._pending_messages.pop(session_key, None)
+        if event is not None:
+            from gateway.pending_trace import trace
+            trace('pending_pop', session_key, event, producer='base.get_pending')
+        return event
 
     def build_source(
         self, chat_id: str, chat_name: Optional[str] = None, chat_type: str = "dm",

@@ -249,6 +249,20 @@ def _update_read_timestamp(filepath: str, task_id: str) -> None:
 def _file_metadata(resolved: str) -> tuple | None:
     try:
         st = os.stat(resolved)
+        if os.name == 'nt' and stat.S_ISREG(st.st_mode):
+            # Windows Python can expose birth time via stat(path).ctime but
+            # change time via fstat(fd).ctime (CPython #157671). Keep the true
+            # descriptor change-time at BOTH ends; do not omit the ctime gate.
+            fd = os.open(resolved, os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_BINARY', 0))
+            try:
+                opened = os.fstat(fd)
+                if (not stat.S_ISREG(opened.st_mode) or any(
+                        getattr(st, name) != getattr(opened, name)
+                        for name in ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns'))):
+                    return None
+                st = opened
+            finally:
+                os.close(fd)
         return st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
     except OSError:
         return None
@@ -265,10 +279,11 @@ def _file_version(resolved: str) -> tuple | None:
             if not stat.S_ISREG(before.st_mode):
                 return None
             digest = hashlib.file_digest(stream, "sha256").digest()
-            after = os.stat(resolved)
+            after_handle = os.fstat(stream.fileno())
+            after = _file_metadata(resolved)
         fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
         version = tuple(getattr(before, name) for name in fields)
-        if version == tuple(getattr(after, name) for name in fields):
+        if version == tuple(getattr(after_handle, name) for name in fields) == after:
             return (*version, digest)
         return None
     except OSError:

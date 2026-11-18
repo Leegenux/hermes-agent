@@ -47,11 +47,17 @@ def _adapter_with_recording_client(stream):
         def get_extra_info(self, name):
             return sock if name == "socket" else None
 
+        def close(self):
+            sock.close()
+
     class _Client:
         def __init__(self):
-            self._transport = SimpleNamespace(
-                _pool=SimpleNamespace(_connections=[_Conn()])
-            )
+            # Use a known direct transport/pool; an unknown wrapper must remain
+            # excluded by the ownership safety boundary. Only the socket is a
+            # recording double, so the original thread/close assertions remain.
+            import httpx
+            self._transport = httpx.HTTPTransport(verify=False)
+            self._transport._pool._connections = [_Conn()]
 
     class _LeafClient:
         def __init__(self):
@@ -61,6 +67,7 @@ def _adapter_with_recording_client(stream):
 
         def close(self):
             events.append(("client.close", threading.get_ident()))
+            self._client._transport.close()
 
     return _CodexCompletionsAdapter(_LeafClient(), "gpt-5.5"), events
 

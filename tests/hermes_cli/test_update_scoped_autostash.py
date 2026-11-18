@@ -87,4 +87,5 @@ def test_up_to_date_checkout_never_offers_to_delete(tmp_path, monkeypatch):
         gw_input_fn=None, switch_branch=False, _windows_gateway_resume=None)
 
     assert plan.commit_count == 0
-    assert "a.txt" in _git(work, "stash", "show", "--name-only", plan.auto_stash_ref)  # kept, not deleted
+    assert plan.auto_stash_ref is None
+    assert (work / "a.txt").read_text() == "a\nmine\n"  # kept in place, not stashed/deleted

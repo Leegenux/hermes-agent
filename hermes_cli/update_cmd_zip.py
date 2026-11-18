@@ -18,6 +18,7 @@ from hermes_cli._early_recovery import _keep_aside
 from hermes_cli._early_recovery_zip import (
     ZIP_SWAP_JOURNAL, restore_interrupted_zip_swap, write_zip_swap_journal, zip_entry_identity, zip_swap_owner_lock)
 from hermes_cli.update_cmd_common import _record_stop
+from hermes_cli import update_local_patches as _local_patches
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("hermes_cli.update_cmd")
@@ -623,6 +624,7 @@ def _update_via_zip(args, *, had_desktop_app_before_update: bool = False,
     A supplied commit keeps the archive on the target selected before Git failed.
     """
     from hermes_cli.update_cmd import _m, _complete_source_update
+    _local_patches.refuse_zip(_m().PROJECT_ROOT)
     # The static archive would silently ignore --branch — the exact silent-divergence bug it exists to
     # prevent. Refuse rather than lie.
     branch = _m()._resolve_update_branch(args)

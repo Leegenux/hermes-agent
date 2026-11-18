@@ -148,33 +148,50 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
         request_id=request_id, payload=payload, intent=intent)
     if retired is not None:
         return retired
+    frozen = json.loads(encoded)
+    return db._execute_write(lambda conn: _admit_session_input_on_conn(
+        conn, epoch=epoch, principal_id=principal_id, session_id=session_id,
+        request_id=request_id, payload=frozen, intent=intent,
+        _authorize_write=_authorize_write, _replay_guard=_replay_guard))
+
+
+def _admit_session_input_on_conn(conn, *, epoch: int, principal_id: str, session_id: str,
+                                 request_id: str, payload: dict, intent: str = 'queue',
+                                 _authorize_write=None, _replay_guard=None) -> dict:
+    """Admit on the caller's transaction connection; never open, commit, or perform I/O."""
+    for value in (principal_id, session_id, request_id):
+        _text(value)
+    if intent not in ('queue', 'steer', 'redirect'):
+        raise RuntimeStoreError('invalid_params')
+    encoded = _json(payload)
+    from hermes_state_terminal import retry_terminal_admission_on_conn
+    retired = retry_terminal_admission_on_conn(conn, epoch=epoch, principal_id=principal_id,
+        session_id=session_id, request_id=request_id, payload=json.loads(encoded), intent=intent)
+    if retired is not None:
+        return retired
     digest = admission_fingerprint(canonical_target=session_id, payload={'input': json.loads(encoded), 'intent': intent})
-    def write(conn):
-        _epoch(conn, epoch)
-        _session(conn, session_id)
-        old = conn.execute('''SELECT * FROM session_admissions
-            WHERE principal_id=? AND target_session_id=? AND request_id=?''', (principal_id, session_id, request_id)).fetchone()
-        if old is not None:
-            if old['payload_digest'] != digest:
-                raise RuntimeStoreError('admission_conflict', **ADMITTED_REQUEST_CONFLICT)
-            if _replay_guard is not None:
-                _replay_guard(conn)
-            return _row(old)
-        queued = conn.execute('''SELECT COUNT(*) FROM session_admissions WHERE target_session_id=?
-            AND status='queued' ''', (session_id,)).fetchone()[0]
-        # Main's cap holds in both states: a FIFO paused behind an unknown turn runs every accepted
-        # input after Discard, so it must not grow without bound while nobody resolves it.
-        if queued >= ADMISSION_QUEUE_MAX:
-            raise RuntimeStoreError('queue_full')
-        if _authorize_write is not None:
-            _authorize_write(conn)
-        admission_id = uuid.uuid4().hex
-        conn.execute('''INSERT INTO session_admissions(admission_id,request_id,principal_id,
-            target_session_id,lineage_json,payload_json,payload_digest,intent,status,owner_epoch)
-            VALUES(?,?,?,?,?,?,?,?,'queued',?)''',
-            (admission_id, request_id, principal_id, session_id, json.dumps([session_id]), encoded, digest, intent, epoch))
-        return _row(_admission(conn, admission_id))
-    return db._execute_write(write)
+    _epoch(conn, epoch)
+    _session(conn, session_id)
+    old = conn.execute('''SELECT * FROM session_admissions
+        WHERE principal_id=? AND target_session_id=? AND request_id=?''', (principal_id, session_id, request_id)).fetchone()
+    if old is not None:
+        if old['payload_digest'] != digest:
+            raise RuntimeStoreError('admission_conflict', **ADMITTED_REQUEST_CONFLICT)
+        if _replay_guard is not None:
+            _replay_guard(conn)
+        return _row(old)
+    queued = conn.execute('''SELECT COUNT(*) FROM session_admissions WHERE target_session_id=?
+        AND status='queued' ''', (session_id,)).fetchone()[0]
+    if queued >= ADMISSION_QUEUE_MAX:
+        raise RuntimeStoreError('queue_full')
+    if _authorize_write is not None:
+        _authorize_write(conn)
+    admission_id = uuid.uuid4().hex
+    conn.execute('''INSERT INTO session_admissions(admission_id,request_id,principal_id,
+        target_session_id,lineage_json,payload_json,payload_digest,intent,status,owner_epoch)
+        VALUES(?,?,?,?,?,?,?,?,'queued',?)''',
+        (admission_id, request_id, principal_id, session_id, json.dumps([session_id]), encoded, digest, intent, epoch))
+    return _row(_admission(conn, admission_id))
 
 
 def get_session_admission(db, *, admission_id: str) -> dict | None:

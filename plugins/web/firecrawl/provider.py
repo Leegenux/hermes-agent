@@ -296,6 +296,8 @@ async def _scrape_one(url: str, formats: list[str], format: Optional[str]) -> di
         return _error_entry(url, blocked["message"], blocked=blocked)
     try:
         logger.info("Firecrawl scraping: %s", url)
+        from .arxiv_math import normalize_arxiv, scrape_formats
+        formats = scrape_formats(url, formats)
         try:
             # Pass timeout (ms) to Firecrawl so the server-side deadline
             # matches our asyncio deadline. Without this the API uses its
@@ -329,6 +331,8 @@ async def _scrape_one(url: str, formats: list[str], format: Optional[str]) -> di
             return _error_entry(final_url, final_blocked["message"], title=title, raw=True, blocked=final_blocked)
         markdown, html = payload.get("markdown"), payload.get("html")
         content = markdown if format == "markdown" or (format is None and markdown) else html or markdown or ""
+        if format != "html":
+            content = normalize_arxiv(url, {**payload, "metadata": metadata}, content)
         entry = {"url": final_url, "title": title, "content": content, "raw_content": content, "metadata": metadata}
         return _with_scrape_status(entry, metadata)
     except Exception as scrape_err:

@@ -8,10 +8,15 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
+
+# Per-command wall-clock budget for the parallel scans (seconds).
+SCAN_BUDGET_S = 180
+COMPARE_BUDGET_S = 30
 
 # ---------------------------------------------------------------------------
 # Chain registry
@@ -52,7 +57,7 @@ CHAINS: dict[str, dict[str, Any]] = {
     },
     "polygon": {
         "chain_id": 137,
-        "rpc": "https://polygon-rpc.com",
+        "rpc": "https://polygon-bor-rpc.publicnode.com",
         "native": "MATIC",
         "coingecko": "matic-network",
         "explorer": "https://polygonscan.com",
@@ -544,10 +549,32 @@ def decode_uint8(hex_data: str) -> int:
 
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
 
+# The free tier allows ~10-30 req/min. Parallel scans otherwise 429-storm, and each
+# _http_get retry chain can sleep up to 30s, which stalls a scan for minutes. So:
+# cache per URL, serialise callers, and give up on pricing for this run once throttled.
+_CG_LOCK = threading.Lock()
+_CG_CACHE: dict[str, Any] = {}
+_CG_DOWN = False
+
+
+def _cg_get(url: str) -> Any:
+    global _CG_DOWN
+    with _CG_LOCK:
+        if _CG_DOWN:
+            raise RuntimeError("coingecko throttled; prices unavailable this run")
+        if url not in _CG_CACHE:
+            try:
+                _CG_CACHE[url] = _http_get(url, retries=2, timeout=10)
+            except Exception:
+                _CG_DOWN = True
+                raise
+        return _CG_CACHE[url]
+
+
 def cg_price_by_id(cg_id: str) -> Optional[float]:
     try:
         url = f"{COINGECKO_BASE}/simple/price?ids={cg_id}&vs_currencies=usd"
-        data = _http_get(url)
+        data = _cg_get(url)
         return data.get(cg_id, {}).get("usd")
     except Exception:
         return None
@@ -559,7 +586,7 @@ def cg_price_by_ids(cg_ids: list[str]) -> dict[str, float]:
     try:
         joined = ",".join(cg_ids)
         url = f"{COINGECKO_BASE}/simple/price?ids={joined}&vs_currencies=usd"
-        data = _http_get(url)
+        data = _cg_get(url)
         return {k: v.get("usd", 0.0) for k, v in data.items() if "usd" in v}
     except Exception:
         return {}
@@ -583,7 +610,7 @@ def cg_price_by_contract(chain: str, contract: str) -> Optional[float]:
             f"{COINGECKO_BASE}/simple/token_price/{platform}"
             f"?contract_addresses={contract}&vs_currencies=usd"
         )
-        data = _http_get(url)
+        data = _cg_get(url)
         addr_lower = contract.lower()
         for k, v in data.items():
             if k.lower() == addr_lower:
@@ -985,8 +1012,6 @@ def _fetch_chain_stats(chain: str) -> dict[str, Any]:
 
 def cmd_compare(_args: argparse.Namespace) -> None:
     """Compare gas prices and native token prices across all chains simultaneously."""
-    import threading
-
     results: dict[str, Any] = {}
     errors:  dict[str, str] = {}
     lock = threading.Lock()
@@ -1003,8 +1028,9 @@ def cmd_compare(_args: argparse.Namespace) -> None:
     threads = [threading.Thread(target=fetch, args=(c,), daemon=True) for c in CHAINS]
     for t in threads:
         t.start()
+    deadline = time.time() + COMPARE_BUDGET_S
     for t in threads:
-        t.join(timeout=30)
+        t.join(timeout=max(0.0, deadline - time.time()))
 
     sorted_by_gas = sorted(
         results.values(),
@@ -1085,8 +1111,6 @@ def cmd_whale(args: argparse.Namespace) -> None:
 
 def cmd_multichain(args: argparse.Namespace) -> None:
     """Scan same wallet across all 8 chains simultaneously."""
-    import threading
-
     address = require_address(args.address)
     results: dict[str, Any] = {}
     lock = threading.Lock()
@@ -1137,11 +1161,18 @@ def cmd_multichain(args: argparse.Namespace) -> None:
             with lock:
                 results[chain] = {"error": str(exc)}
 
-    threads = [threading.Thread(target=scan_chain, args=(c,)) for c in CHAINS]
+    threads = [
+        threading.Thread(target=scan_chain, args=(c,), daemon=True) for c in CHAINS
+    ]
     for t in threads:
         t.start()
+    deadline = time.time() + SCAN_BUDGET_S  # one budget for the scan, not per thread
     for t in threads:
-        t.join()
+        t.join(timeout=max(0.0, deadline - time.time()))
+    for chain in CHAINS:
+        results.setdefault(
+            chain, {"error": f"timeout (chain did not finish in {SCAN_BUDGET_S}s)"}
+        )
 
     grand_total = sum(
         v.get("total_usd", 0) for v in results.values() if isinstance(v, dict)
@@ -1149,7 +1180,7 @@ def cmd_multichain(args: argparse.Namespace) -> None:
     print_json({
         "address": address,
         "chains": results,
-        "grand_total_usd": round(grand_total, 2),
+        "grand_total_usd": round(grand_total, 2) if grand_total else None,
     })
 
 

@@ -339,6 +339,17 @@ _RAW_INLINE_TOOL_EXECUTORS: dict[str, InlineToolExecutor] = {
     "manage_connections": _manage_connections,
     "manage_catalog": _manage_catalog,
     "setup_mcp": _setup_mcp_shim,
+    # Same-tree messaging needs the live caller for sender identity and tree scope;
+    # registry dispatch never supplies ``parent_agent`` (report 017).
+    "agent_message": _tool(
+        "tools.agent_messaging_tool", "agent_message",
+        ("target", "target"), ("message", "message"), ("message_id", "message_id"),
+        parent_agent=lambda agent, ctx: agent,
+    ),
+    "list_agents": _tool(
+        "tools.agent_messaging_tool", "list_agents",
+        parent_agent=lambda agent, ctx: agent,
+    ),
     "delegate_task": lambda agent, args, ctx: agent._dispatch_delegate_task(args),
 }
 

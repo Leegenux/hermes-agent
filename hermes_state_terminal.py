@@ -127,23 +127,29 @@ def retry_terminal_admission(db, *, epoch, principal_id, session_id, request_id,
     This is a read-only identity lookup, not authorization to attach, restore a
     route, or write. HTTP authentication/grant checks must precede this query.
     """
+    with db._read_ctx() as conn:
+        return retry_terminal_admission_on_conn(conn, epoch=epoch, principal_id=principal_id,
+            session_id=session_id, request_id=request_id, payload=payload, intent=intent)
+
+
+def retry_terminal_admission_on_conn(conn, *, epoch, principal_id, session_id, request_id, payload, intent='queue'):
+    """Read the retired identity on the caller's transaction; never commit or open a connection."""
     for value in (principal_id, session_id, request_id):
         _text(value)
     digest = admission_fingerprint(canonical_target=session_id,
         payload={'input': json.loads(_json(payload)), 'intent': intent})
-    with db._read_ctx() as conn:
-        _epoch(conn, epoch)
-        from hermes_state_mutation_retirement import RETIRED_PREFIX
-        if not conn.execute('SELECT 1 FROM state_meta WHERE key=?', (RETIRED_PREFIX + session_id,)).fetchone():
-            return None
-        saved = conn.execute('SELECT value FROM state_meta WHERE key=?',
-                             (identity_key(principal_id, session_id, request_id),)).fetchone()
-        if saved is None:
-            raise RuntimeStoreError('not_found')
-        row = terminal_admission(conn, json.loads(saved[0]))
-        if row['payload_digest'] != digest:
-            raise RuntimeStoreError('admission_conflict', **ADMITTED_REQUEST_CONFLICT)
-        return _row(row)
+    _epoch(conn, epoch)
+    from hermes_state_mutation_retirement import RETIRED_PREFIX
+    if not conn.execute('SELECT 1 FROM state_meta WHERE key=?', (RETIRED_PREFIX + session_id,)).fetchone():
+        return None
+    saved = conn.execute('SELECT value FROM state_meta WHERE key=?',
+                         (identity_key(principal_id, session_id, request_id),)).fetchone()
+    if saved is None:
+        raise RuntimeStoreError('not_found')
+    row = terminal_admission(conn, json.loads(saved[0]))
+    if row['payload_digest'] != digest:
+        raise RuntimeStoreError('admission_conflict', **ADMITTED_REQUEST_CONFLICT)
+    return _row(row)
 
 
 def terminal_worker_receipt(db, *, execution_id, session_id, generation, sequence,

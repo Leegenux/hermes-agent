@@ -521,7 +521,14 @@ class GatewayAgentCacheMixin:
             with _log_suppressed(logging.WARNING, "Failed to interrupt running agent for %s; continuing",
                                  session_key, exc_info=True):
                 request_hard_interrupt(running_agent, interrupt_reason, tool_reason=tool_reason)
-            _process_task_id = getattr(running_agent, "_gateway_turn_process_task_id", "")
+            from gateway.pending_trace import trace
+            try:
+                trace_event = state.turn.running_event()
+            except Exception:
+                trace_event = None
+            trace('hard_interrupt', session_key, trace_event, agent=running_agent,
+                  producer='runner_hard_interrupt', runner=self)
+            _process_task_id =  getattr(running_agent, "_gateway_turn_process_task_id", "")
             _process_baseline = getattr(running_agent, "_gateway_turn_process_baseline", None)
         # Bump the generation BEFORE scheduling the reap thread and capture the post-bump value:
         # task_id is session-scoped, so a replacement turn spawning before the reap runs bumps it
@@ -604,6 +611,8 @@ class GatewayAgentCacheMixin:
                     overflow.remove(wake)
             if wake is not None:
                 adapter._pending_messages[session_key] = wake
+                from gateway.pending_trace import trace
+                trace('fifo_restore_wake', session_key, wake, producer='runner_hard_interrupt', runner=self)
         if state is not None:
             state.persistent.pending_command_text = None
         if release_running_state:

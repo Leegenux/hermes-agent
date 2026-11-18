@@ -200,7 +200,7 @@ from plugins.platforms.telegram.telegram_network import (
 from plugins.platforms.telegram.telegram_outbound import is_visually_empty, resolve_notifications_mode
 from plugins.platforms.telegram.telegram_send_path_recovery import TelegramSendPathRecoveryMixin, mark_send_path_recovered
 from plugins.platforms.telegram.telegram_send_errors import LOST, is_entity_parse_error, maybe_delivered_result as _maybe_delivered_result, send_error_kind
-from plugins.platforms.telegram.telegram_typing_gate import typing_may_fire
+from plugins.platforms.telegram.telegram_typing_gate import forget_typing_waiter, typing_may_fire
 from plugins.platforms.telegram.telegram_group_observe import apply_group_observe_attribution, shared_sender_suffix
 from plugins.platforms.telegram.telegram_picker_labels import model_button_labels
 from plugins.platforms.telegram.telegram_topic_routing import TelegramTopicRoutingMixin
@@ -1617,6 +1617,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         """Record successful getUpdates I/O for the current generation only; True when accepted."""
         if self._teardown_started or not self._polling_progress_accepting or generation != self._polling_generation:
             return False
+        was_degraded = self._send_path_degraded
         if not self._polling_progress_event.is_set():
             # First confirmed round-trip resolves the "health pending" line both reconnect paths end on.
             # After network-error WARNINGs the line must read as the matching recovery event (#111211).
@@ -1636,6 +1637,15 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
                 self._polling_conflict_count = 0
                 self._polling_conflict_quiet_since = None
         mark_send_path_recovered(self)
+        if was_degraded:
+            # Local: hand the degraded -> healthy edge to the runner's debounced, profile-scoped sweep.
+            runner = getattr(self, "gateway_runner", None)
+            schedule = getattr(runner, "_schedule_send_path_recovery", None)
+            if callable(schedule):
+                try:
+                    schedule(self, reason="recovered")
+                except Exception:
+                    logger.debug("[%s] Could not schedule send-path recovery sweep", self.name, exc_info=True)
         return True
 
     def _observe_polling_request_result(self, request, generation, result):
@@ -4480,7 +4490,7 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         await edit_keeping_prompt(self, query, edit_text)
         # Typing was paused when the approval was sent; the text /approve and /deny paths resume it too.
         if count and cb["chat_id"] is not None:
-            self.resume_typing_for_chat(str(cb["chat_id"]))
+            self.resume_typing_for_chat(str(cb["chat_id"]), metadata={"thread_id": cb.get("thread_id")})
 
     async def _handle_slash_confirm_callback(self, query, data: str, cb: dict[str, Any]) -> None:
         """``sc:<choice>:<confirm_id>`` — resolve a slash-command confirmation."""
@@ -5222,9 +5232,29 @@ class TelegramAdapter(TelegramContactMixin, TelegramHeldInboundMixin, TelegramRe
         slot_until[str(normalize_telegram_chat_id(chat_id))] = (
             asyncio.get_running_loop().time() + max(0.0, budget))
 
+    TYPING_SEND_TIMEOUT_SECONDS = 1.5
+
+    async def _keep_typing(self, chat_id: str, interval: float = 0.5, metadata=None,
+                           stop_event: asyncio.Event | None = None) -> None:
+        # Cheap admission checks cover staggered topics; the gate still paces real Bot API calls.
+        await super()._keep_typing(chat_id, interval=interval, metadata=metadata, stop_event=stop_event)
+
+    async def stop_typing(self, chat_id: str, metadata=None) -> None:
+        """Telegram has no cancel action; retire only this topic's pending admission."""
+        forget_typing_waiter(self, chat_id, metadata)
+
     async def send_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> None:
         """Send typing indicator."""
-        if not self._bot or not typing_may_fire(self, chat_id):
+        if not self._bot:
+            # Reconnect replaced this adapter mid-turn while the typing refresh loop keeps
+            # running on this instance: forward the heartbeat to the live adapter instead of
+            # going silent for the rest of the turn.
+            live = self._replacement_telegram_adapter()
+            if live is None:
+                return
+            await live.send_typing(chat_id, metadata=metadata)
+            return
+        if not typing_may_fire(self, chat_id, metadata):
             return
         _is_dm_topic: bool = False
         message_thread_id: Optional[int] = None
